@@ -1,0 +1,4 @@
+/target
+
+# A library, so the lock file is not the consumer's and is not committed.
+Cargo.lock
