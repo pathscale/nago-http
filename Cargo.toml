@@ -1,6 +1,6 @@
 [package]
 name = "nago-http"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A small HTTP/1.1 client over nagoya and nago-rustls. No tokio, no OpenSSL, no C"

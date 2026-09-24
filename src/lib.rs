@@ -33,16 +33,20 @@
 //!
 //! # Timeouts
 //!
-//! None are imposed here. Wrap the call in [`nagoya::timeout`] with whatever
-//! budget the API deserves: a long poll and a boot-time secrets fetch want very
-//! different ones.
+//! [`send`] imposes none: wrap it in [`nagoya::timeout`] with whatever budget
+//! the API deserves. [`Client`] gives every request a deadline, 30 s unless
+//! [`Client::with_timeout`] says otherwise.
 
 use core::fmt;
 
 use nago_rustls::TlsSession;
 use nago_rustls::rustls::ClientConnection;
 use nago_rustls::rustls_pki_types::ServerName;
+use nagoya::io::Stream;
 use nagoya::reactor::{Addr, Handle, connect_any, resolve};
+
+mod client;
+pub use client::{Client, DEFAULT_TIMEOUT};
 
 /// Largest response this will buffer. The APIs this is for answer in
 /// kilobytes; anything near this is a fault, not a payload.
@@ -54,11 +58,24 @@ pub struct Target {
     host: String,
     port: u16,
     addrs: Vec<Addr>,
+    tls: bool,
 }
 
 impl Target {
-    /// Resolve `host`. Blocks the calling thread for the lookup.
+    /// Resolve `host`, to be reached over TLS. Blocks the calling thread for
+    /// the lookup.
     pub fn resolve(host: &str, port: u16) -> Result<Self, Error> {
+        Self::resolve_with(host, port, true)
+    }
+
+    /// Resolve `host`, to be reached over plain TCP: for a local stand-in of a
+    /// service (a loopback S3, a test double), not for anything a credential
+    /// crosses the network to. Blocks the calling thread for the lookup.
+    pub fn resolve_plain(host: &str, port: u16) -> Result<Self, Error> {
+        Self::resolve_with(host, port, false)
+    }
+
+    fn resolve_with(host: &str, port: u16, tls: bool) -> Result<Self, Error> {
         let addrs = resolve(host, port).map_err(|err| Error::Resolve(err.to_string()))?;
         if addrs.is_empty() {
             return Err(Error::Resolve(format!("{host} has no addresses")));
@@ -67,6 +84,7 @@ impl Target {
             host: host.to_string(),
             port,
             addrs,
+            tls,
         })
     }
 
@@ -74,9 +92,11 @@ impl Target {
         &self.host
     }
 
-    /// The `Host` header value: the port is included only when it is not 443.
+    /// The `Host` header value: the port is included only when it is not the
+    /// scheme's default (443, or 80 in plain).
     fn host_header(&self) -> String {
-        if self.port == 443 {
+        let default_port = if self.tls { 443 } else { 80 };
+        if self.port == default_port {
             self.host.clone()
         } else {
             format!("{}:{}", self.host, self.port)
@@ -180,6 +200,10 @@ pub enum Error {
     /// The peer answered something that is not HTTP/1.1 this client reads.
     Protocol(String),
     TooLarge,
+    /// The request did not finish within the [`Client`]'s deadline.
+    Timeout(String),
+    /// The URL given to a [`Client`] could not be used.
+    Url(String),
 }
 
 impl fmt::Display for Error {
@@ -191,13 +215,16 @@ impl fmt::Display for Error {
             Self::Io(detail) => write!(f, "connection failed: {detail}"),
             Self::Protocol(detail) => write!(f, "malformed response: {detail}"),
             Self::TooLarge => write!(f, "response exceeded {MAX_RESPONSE} bytes"),
+            Self::Timeout(detail) => write!(f, "timed out: {detail}"),
+            Self::Url(detail) => write!(f, "unusable URL: {detail}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Send one request over a fresh TLS connection and read the whole response.
+/// Send one request over a fresh connection (TLS unless the target was
+/// resolved with [`Target::resolve_plain`]) and read the whole response.
 pub async fn send(
     target: &Target,
     handle: &Handle,
@@ -207,6 +234,13 @@ pub async fn send(
     let stream = connect_any(&target.addrs, handle)
         .await
         .map_err(|err| Error::Connect(format!("{host}: {err}")))?;
+    let bytes = request.encode(&target.host_header());
+    // A response to HEAD has no body, whatever Content-Length says.
+    let head = request.method.eq_ignore_ascii_case("HEAD");
+    if !target.tls {
+        let mut stream = stream;
+        return exchange(&mut stream, host, &bytes, head).await;
+    }
     let name = ServerName::try_from(host.clone())
         .map_err(|_| Error::Tls(format!("invalid server name {host}")))?;
     let session = ClientConnection::new(nago_rustls::default_client_config(), name)
@@ -215,23 +249,35 @@ pub async fn send(
     tls.handshake()
         .await
         .map_err(|err| Error::Tls(format!("handshake with {host}: {err:?}")))?;
-    tls.write_all(&request.encode(&target.host_header()))
+    let response = exchange(&mut tls, host, &bytes, head).await;
+    let _ = tls.close().await;
+    response
+}
+
+/// Write `request` and read until a whole response has arrived.
+async fn exchange<S: Stream>(
+    stream: &mut S,
+    host: &str,
+    request: &[u8],
+    head: bool,
+) -> Result<Response, Error> {
+    stream
+        .write_all(request)
         .await
         .map_err(|err| Error::Io(format!("writing to {host}: {err:?}")))?;
 
     let mut buffer = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     loop {
-        if let Some(response) = parse_response(&buffer, false)? {
-            let _ = tls.close().await;
+        if let Some(response) = parse_response(&buffer, false, head)? {
             return Ok(response);
         }
-        let read = tls
+        let read = stream
             .read(&mut chunk)
             .await
             .map_err(|err| Error::Io(format!("reading from {host}: {err:?}")))?;
         if read == 0 {
-            return parse_response(&buffer, true)?.ok_or_else(|| {
+            return parse_response(&buffer, true, head)?.ok_or_else(|| {
                 Error::Protocol(format!("{host} closed the connection mid-response"))
             });
         }
@@ -246,7 +292,13 @@ pub async fn send(
 ///
 /// `at_eof` says the peer has closed: a body framed by neither length nor
 /// chunking ends there, and one that is framed but short is an error.
-fn parse_response(buffer: &[u8], at_eof: bool) -> Result<Option<Response>, Error> {
+/// `head_request` says the request was HEAD, whose response has no body; 1xx, 204 and 304
+/// never do either (RFC 9112 section 6.3).
+fn parse_response(
+    buffer: &[u8],
+    at_eof: bool,
+    head_request: bool,
+) -> Result<Option<Response>, Error> {
     let protocol = |detail: &str| Error::Protocol(detail.to_string());
     let Some(head_end) = find(buffer, b"\r\n\r\n") else {
         if at_eof {
@@ -285,7 +337,10 @@ fn parse_response(buffer: &[u8], at_eof: bool) -> Result<Option<Response>, Error
     }
 
     let body = &buffer[head_end + 4..];
-    let body = if chunked {
+    let bodiless = head_request || (100..200).contains(&status) || status == 204 || status == 304;
+    let body = if bodiless {
+        Vec::new()
+    } else if chunked {
         match decode_chunked(body)? {
             Some(body) => body,
             None if at_eof => return Err(protocol("connection closed inside a chunked body")),
@@ -349,11 +404,11 @@ mod tests {
     #[test]
     fn content_length_body_waits_for_every_byte() {
         let partial = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel";
-        assert!(parse_response(partial, false).unwrap().is_none());
-        assert!(parse_response(partial, true).is_err());
+        assert!(parse_response(partial, false, false).unwrap().is_none());
+        assert!(parse_response(partial, true, false).is_err());
 
         let full = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Id: 7\r\n\r\nhello";
-        let response = parse_response(full, false).unwrap().unwrap();
+        let response = parse_response(full, false, false).unwrap().unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"hello");
         assert_eq!(response.header("x-id"), Some("7"));
@@ -362,21 +417,21 @@ mod tests {
     #[test]
     fn chunked_body_is_reassembled() {
         let raw = b"HTTP/1.1 502 Bad Gateway\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nwiki\r\n5;x=y\r\npedia\r\n0\r\n\r\n";
-        let response = parse_response(raw, false).unwrap().unwrap();
+        let response = parse_response(raw, false, false).unwrap().unwrap();
         assert_eq!(response.status, 502);
         assert!(!response.is_success());
         assert_eq!(response.body, b"wikipedia");
 
         let unfinished = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nwiki\r\n";
-        assert!(parse_response(unfinished, false).unwrap().is_none());
+        assert!(parse_response(unfinished, false, false).unwrap().is_none());
     }
 
     #[test]
     fn unframed_body_ends_at_eof() {
         let raw = b"HTTP/1.1 200 OK\r\n\r\nall of it";
-        assert!(parse_response(raw, false).unwrap().is_none());
+        assert!(parse_response(raw, false, false).unwrap().is_none());
         assert_eq!(
-            parse_response(raw, true).unwrap().unwrap().body,
+            parse_response(raw, true, false).unwrap().unwrap().body,
             b"all of it"
         );
     }
