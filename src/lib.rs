@@ -92,14 +92,19 @@ impl Target {
         &self.host
     }
 
-    /// The `Host` header value: the port is included only when it is not the
-    /// scheme's default (443, or 80 in plain).
+    /// The `Host` header value: an IPv6 address in brackets, and the port only
+    /// when it is not the scheme's default (443, or 80 in plain).
     fn host_header(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         let default_port = if self.tls { 443 } else { 80 };
         if self.port == default_port {
-            self.host.clone()
+            host
         } else {
-            format!("{}:{}", self.host, self.port)
+            format!("{host}:{}", self.port)
         }
     }
 }
@@ -158,6 +163,15 @@ impl<'a> Request<'a> {
                     body.len()
                 ));
                 body
+            }
+            // A request that could carry a body says it has none: some
+            // servers refuse a bodyless POST without Content-Length.
+            None if ["POST", "PUT", "PATCH"]
+                .iter()
+                .any(|m| self.method.eq_ignore_ascii_case(m)) =>
+            {
+                head.push_str("Content-Length: 0\r\n");
+                &[]
             }
             None => &[],
         };
