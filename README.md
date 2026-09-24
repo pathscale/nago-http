@@ -8,6 +8,23 @@ It is for the outbound calls a backend makes to someone else's API: a secrets
 store at boot, a bot platform, a payment gateway. One request per connection,
 `Content-Length` or `chunked` bodies, and nothing else.
 
+Most callers want a `Client`: requests by URL, from any executor. It runs its own
+reactor on a thread of its own, resolves each host once, and gives every request
+a deadline (30 s unless `with_timeout` says otherwise).
+
+```rust
+let client = nago_http::Client::global()?;
+let response = client
+    .post("https://api.example.com/v1/thing", &[], "application/json", br#"{"a":1}"#)
+    .await?;
+```
+
+`https://` goes over TLS; `http://` is plain TCP, for a local stand-in such as a
+loopback S3, never for a credential crossing the network. `HEAD`, 1xx, 204 and 304
+responses have no body, whatever `Content-Length` says.
+
+To drive the reactor yourself, resolve a `Target` and call `send`:
+
 ```rust
 use nagoya::reactor::{Reactor, block_on_with};
 
@@ -21,7 +38,7 @@ let response = block_on_with(&reactor, nago_http::send(
 ))?;
 ```
 
-No timeouts are imposed; wrap the call in `nagoya::timeout`.
+`send` imposes no timeout; wrap it in `nagoya::timeout`.
 
 ## License
 
