@@ -36,7 +36,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Client {
     reactor: Reactor,
     /// Resolved hosts, by (TLS, host, port). Resolution blocks, so it happens
-    /// once per host rather than once per request.
+    /// once per host rather than once per request, and again after a request to
+    /// that host fails to connect.
     targets: Mutex<HashMap<(bool, String, u16), Target>>,
     timeout: Duration,
 }
@@ -108,14 +109,24 @@ impl Client {
             request = request.body(content_type, body);
         }
         let handle = self.reactor.handle();
-        match nagoya::timeout(self.timeout, send(&target, &handle, request)).await {
+        let result = match nagoya::timeout(self.timeout, send(&target, &handle, request)).await {
             Ok(result) => result,
             Err(_) => Err(Error::Timeout(format!(
                 "{} did not answer within {}s",
                 url.host,
                 self.timeout.as_secs()
             ))),
+        };
+        // A host that could not be reached may have moved: forget its address,
+        // so the next request resolves it again.
+        if let Err(Error::Connect(_) | Error::Tls(_) | Error::Io(_) | Error::Timeout(_)) = &result {
+            self.targets.lock().expect("not poisoned").remove(&(
+                url.tls,
+                url.host.to_string(),
+                url.port,
+            ));
         }
+        result
     }
 
     /// `GET url`.
