@@ -23,12 +23,14 @@ let response = client
 loopback S3, never for a credential crossing the network. `HEAD`, 1xx, 204 and 304
 responses have no body, whatever `Content-Length` says.
 
-To drive the reactor yourself, resolve a `Target` and call `send`:
+To drive the reactor yourself, give `Target::pinned` the addresses you already
+have, then call `send`:
 
 ```rust
 use nagoya::reactor::{Reactor, block_on_with};
 
-let target = nago_http::Target::resolve("api.example.com", 443)?; // blocks: do it first
+let addresses = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 17))];
+let target = nago_http::Target::pinned("api.example.com", 443, &addresses, true)?;
 let reactor = Reactor::local()?;
 let handle = reactor.handle();
 let response = block_on_with(&reactor, nago_http::send(
@@ -37,6 +39,11 @@ let response = block_on_with(&reactor, nago_http::send(
     nago_http::Request::post("/v1/thing").body("application/json", br#"{"a":1}"#),
 ))?;
 ```
+
+`open` dials only the addresses stored in its `Target`; it does not look up the
+host name. A pinned target already in a `Client` cache stays there after a
+failed connection. Resolved targets continue to be looked up again after a
+connection failure.
 
 `send` imposes no timeout; wrap it in `nagoya::timeout`.
 

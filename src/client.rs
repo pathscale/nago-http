@@ -35,9 +35,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Requests by URL, over a reactor this client runs on its own thread.
 pub struct Client {
     reactor: Reactor,
-    /// Resolved hosts, by (TLS, host, port). Resolution blocks, so it happens
-    /// once per host rather than once per request, and again after a request to
-    /// that host fails to connect.
+    /// Targets by (TLS, host, port). Resolved targets are resolved once per
+    /// host and again after a connection failure; pinned targets stay cached.
     targets: Mutex<HashMap<(bool, String, u16), Target>>,
     timeout: Duration,
 }
@@ -119,7 +118,10 @@ impl Client {
         };
         // A host that could not be reached may have moved: forget its address,
         // so the next request resolves it again.
-        if let Err(Error::Connect(_) | Error::Tls(_) | Error::Io(_) | Error::Timeout(_)) = &result {
+        if !target.is_pinned()
+            && let Err(Error::Connect(_) | Error::Tls(_) | Error::Io(_) | Error::Timeout(_)) =
+                &result
+        {
             self.targets.lock().expect("not poisoned").remove(&(
                 url.tls,
                 url.host.to_string(),
@@ -161,6 +163,104 @@ impl Client {
             .expect("not poisoned")
             .insert(key, target.clone());
         Ok(target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn read_request(stream: &mut std::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn client_keeps_a_pinned_target_after_connect_fails() {
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let client = Client::new().unwrap();
+        let key = (false, "example.com".to_string(), port);
+        let target = Target::pinned(
+            "example.com",
+            port,
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            false,
+        )
+        .unwrap();
+        client.targets.lock().unwrap().insert(key.clone(), target);
+        let url = format!("http://example.com:{port}/");
+
+        let first = nagoya::block_on(nagoya::timeout(
+            Duration::from_secs(2),
+            client.get(&url, &[]),
+        ))
+        .expect("client request deadline");
+        assert!(matches!(first, Err(Error::Connect(_))));
+        assert!(
+            client
+                .targets
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(Target::is_pinned)
+        );
+
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody")
+                .expect("write response");
+            release_rx.recv().expect("test releases listener");
+        });
+
+        let second = nagoya::block_on(nagoya::timeout(
+            Duration::from_secs(2),
+            client.get(&url, &[]),
+        ))
+        .expect("client request deadline")
+        .expect("the cached pinned address is still used");
+        assert_eq!(second.body, b"body");
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn client_forgets_an_unpinned_target_after_connect_fails() {
+        let client = Client::new().unwrap();
+        let url = "http://127.0.0.1:1/";
+        let result = nagoya::block_on(nagoya::timeout(
+            Duration::from_secs(2),
+            client.get(url, &[]),
+        ))
+        .expect("client request deadline");
+        assert!(matches!(result, Err(Error::Connect(_))));
+        assert!(
+            !client
+                .targets
+                .lock()
+                .unwrap()
+                .contains_key(&(false, "127.0.0.1".to_string(), 1,))
+        );
     }
 }
 
