@@ -47,6 +47,7 @@ use nagoya::reactor::{Addr, Handle, TcpStream, connect_any, resolve};
 
 mod client;
 pub use client::{Client, DEFAULT_TIMEOUT};
+pub use nago_rustls::rustls;
 
 /// Largest response this will buffer. The APIs this is for answer in
 /// kilobytes; anything near this is a fault, not a payload.
@@ -301,6 +302,15 @@ impl std::error::Error for Error {}
 /// Establish TCP and, when selected by the target, complete the TLS handshake.
 /// This dials only the addresses stored in `target` and never resolves its host.
 pub async fn open(target: &Target, handle: &Handle) -> Result<Connection, Error> {
+    open_with_tls_config(target, handle, None).await
+}
+
+/// Open with the caller's TLS policy. `None` retains the default policy.
+pub async fn open_with_tls_config(
+    target: &Target,
+    handle: &Handle,
+    tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+) -> Result<Connection, Error> {
     let name = if target.tls {
         Some(
             ServerName::try_from(target.host.clone())
@@ -311,8 +321,11 @@ pub async fn open(target: &Target, handle: &Handle) -> Result<Connection, Error>
     };
     let session = name
         .map(|name| {
-            ClientConnection::new(nago_rustls::default_client_config(), name)
-                .map_err(|err| Error::Tls(err.to_string()))
+            ClientConnection::new(
+                tls_config.unwrap_or_else(nago_rustls::default_client_config),
+                name,
+            )
+            .map_err(|err| Error::Tls(err.to_string()))
         })
         .transpose()?;
     let stream = connect_any(&target.addrs, handle)

@@ -8,6 +8,12 @@ It is for the outbound calls a backend makes to someone else's API: a secrets
 store at boot, a bot platform, a payment gateway. One request per connection,
 `Content-Length` or `chunked` bodies, and nothing else.
 
+Callers with a private trust policy can use `Client::with_tls_config(Arc<ClientConfig>)`
+or `open_with_tls_config(target, handle, Some(config))`. HTTPS uses that policy
+without adding system or default WebPKI roots. The URL hostname remains the SNI
+and certificate verification name, including for pinned socket addresses. The
+original constructors keep their default policy for other consumers.
+
 Most callers want a `Client`: requests by URL, from any executor. It runs its own
 reactor on a thread of its own, resolves each host once, and gives every request
 a deadline (30 s unless `with_timeout` says otherwise).
