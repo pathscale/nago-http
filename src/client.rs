@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use nagoya::reactor::Reactor;
 
-use crate::{Error, Request, Response, Target, send};
+use crate::{Error, Request, Response, Target};
 
 /// How long a request may take, connect to last byte, unless
 /// [`Client::with_timeout`] says otherwise. The APIs this is for answer in
@@ -34,6 +34,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Requests by URL, over a reactor this client runs on its own thread.
 pub struct Client {
+    tls_config: Option<std::sync::Arc<nago_rustls::rustls::ClientConfig>>,
     reactor: Reactor,
     /// Targets by (TLS, host, port). Resolved targets are resolved once per
     /// host and again after a connection failure; pinned targets stay cached.
@@ -60,6 +61,7 @@ impl Client {
         let reactor =
             Reactor::start().map_err(|err| Error::Io(format!("starting the reactor: {err:?}")))?;
         Ok(Self {
+            tls_config: None,
             reactor,
             targets: Mutex::new(HashMap::new()),
             timeout: DEFAULT_TIMEOUT,
@@ -76,6 +78,16 @@ impl Client {
         // Losing a race to another first caller drops this one, which stops
         // its thread; the winner serves everyone.
         Ok(CLIENT.get_or_init(|| client))
+    }
+
+    /// Start a client with the caller's TLS policy. HTTPS never substitutes
+    /// the default roots when this configuration is supplied.
+    pub fn with_tls_config(
+        config: std::sync::Arc<nago_rustls::rustls::ClientConfig>,
+    ) -> Result<Self, Error> {
+        let mut client = Self::new()?;
+        client.tls_config = Some(config);
+        Ok(client)
     }
 
     /// Give every request this much time, connect to last byte.
@@ -108,7 +120,13 @@ impl Client {
             request = request.body(content_type, body);
         }
         let handle = self.reactor.handle();
-        let result = match nagoya::timeout(self.timeout, send(&target, &handle, request)).await {
+        let result = match nagoya::timeout(self.timeout, async {
+            let connection =
+                crate::open_with_tls_config(&target, &handle, self.tls_config.clone()).await?;
+            connection.send(request).await
+        })
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(Error::Timeout(format!(
                 "{} did not answer within {}s",
