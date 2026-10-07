@@ -69,13 +69,9 @@ fn put_writes_a_large_body_to_a_slow_reader() {
         .with_timeout(Duration::from_secs(10));
     let body = vec![0xA5; BODY_SIZE];
     let url = format!("http://{address}/snapshot");
-    let response = nagoya::block_on(client.send(
-        "PUT",
-        &url,
-        &[],
-        Some(("application/octet-stream", &body)),
-    ))
-    .expect("large PUT");
+    let response =
+        nagoya::block_on(client.send("PUT", &url, &[], Some(("application/octet-stream", &body))))
+            .expect("large PUT");
 
     assert_eq!(response.status, 200);
     assert_eq!(server.join().expect("server thread"), BODY_SIZE);
