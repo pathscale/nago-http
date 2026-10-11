@@ -12,7 +12,15 @@ Callers with a private trust policy can use `Client::with_tls_config(Arc<ClientC
 or `open_with_tls_config(target, handle, Some(config))`. HTTPS uses that policy
 without adding system or default WebPKI roots. The URL hostname remains the SNI
 and certificate verification name, including for pinned socket addresses. The
-original constructors keep their default policy for other consumers.
+original constructors keep their default roots for other consumers.
+
+Version 0.1.4 leaves provider selection to the host. Before `Client::new`,
+`Client::global`, or default HTTPS through `open`/`send`, the binary must
+install its chosen rustls `CryptoProvider` with `install_default()`.
+These APIs check `CryptoProvider::get_default()` and return `Error::Tls`
+with an installation instruction if no process default exists. They never
+enable or install a provider through crate features. Plain TCP through
+`open`/`send` and explicitly supplied TLS configs need no process default.
 
 Most callers want a `Client`: requests by URL, from any executor. It runs its own
 reactor on a thread of its own, resolves each host once, and gives every request

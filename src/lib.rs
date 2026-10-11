@@ -299,18 +299,34 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub(crate) fn require_crypto_provider() -> Result<(), Error> {
+    rustls::crypto::CryptoProvider::get_default()
+        .ok_or_else(|| {
+            Error::Tls(
+                "no process-default rustls crypto provider installed; the host must call CryptoProvider::install_default before using default TLS".into(),
+            )
+        })
+        .map(|_| ())
+}
+
 /// Establish TCP and, when selected by the target, complete the TLS handshake.
+/// Default TLS requires a process-default crypto provider installed by the host.
 /// This dials only the addresses stored in `target` and never resolves its host.
 pub async fn open(target: &Target, handle: &Handle) -> Result<Connection, Error> {
     open_with_tls_config(target, handle, None).await
 }
 
-/// Open with the caller's TLS policy. `None` retains the default policy.
+/// Open with the caller's TLS policy. `None` uses the host's process-default
+/// provider and default roots; missing providers return a TLS error. Plain TCP
+/// and supplied configurations do not require a process-default provider.
 pub async fn open_with_tls_config(
     target: &Target,
     handle: &Handle,
     tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
 ) -> Result<Connection, Error> {
+    if target.tls && tls_config.is_none() {
+        require_crypto_provider()?;
+    }
     let name = if target.tls {
         Some(
             ServerName::try_from(target.host.clone())
@@ -707,7 +723,7 @@ mod tests {
 
     #[test]
     fn pinned_tls_sni_is_the_hostname_while_the_dial_is_the_address() {
-        let _ = nago_rustls::rustls::crypto::ring::default_provider().install_default();
+        let _ = ps_rustcrypto::provider().install_default();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {

@@ -53,15 +53,20 @@ impl core::fmt::Debug for Client {
 impl Client {
     /// Start a client and its reactor thread.
     ///
-    /// Also installs rustls' `ring` provider as the process default if none
-    /// is installed yet: nago-rustls builds its configuration from the process
-    /// default, and a request made before anything installed one would panic.
+    /// Requires a process-default rustls crypto provider installed by the host.
+    /// Returns a TLS error when none is installed, before starting the reactor.
     pub fn new() -> Result<Self, Error> {
-        let _ = nago_rustls::rustls::crypto::ring::default_provider().install_default();
+        crate::require_crypto_provider()?;
+        Self::start(None)
+    }
+
+    fn start(
+        tls_config: Option<std::sync::Arc<nago_rustls::rustls::ClientConfig>>,
+    ) -> Result<Self, Error> {
         let reactor =
             Reactor::start().map_err(|err| Error::Io(format!("starting the reactor: {err:?}")))?;
         Ok(Self {
-            tls_config: None,
+            tls_config,
             reactor,
             targets: Mutex::new(HashMap::new()),
             timeout: DEFAULT_TIMEOUT,
@@ -81,13 +86,12 @@ impl Client {
     }
 
     /// Start a client with the caller's TLS policy. HTTPS never substitutes
-    /// the default roots when this configuration is supplied.
+    /// the default roots when this configuration is supplied. No process-default
+    /// provider is required: this configuration already carries its provider.
     pub fn with_tls_config(
         config: std::sync::Arc<nago_rustls::rustls::ClientConfig>,
     ) -> Result<Self, Error> {
-        let mut client = Self::new()?;
-        client.tls_config = Some(config);
-        Ok(client)
+        Self::start(Some(config))
     }
 
     /// Give every request this much time, connect to last byte.
@@ -213,6 +217,7 @@ mod tests {
         let port = reservation.local_addr().unwrap().port();
         drop(reservation);
 
+        let _ = ps_rustcrypto::provider().install_default();
         let client = Client::new().unwrap();
         let key = (false, "example.com".to_string(), port);
         let target = Target::pinned(
@@ -264,6 +269,7 @@ mod tests {
 
     #[test]
     fn client_forgets_an_unpinned_target_after_connect_fails() {
+        let _ = ps_rustcrypto::provider().install_default();
         let client = Client::new().unwrap();
         let url = "http://127.0.0.1:1/";
         let result = nagoya::block_on(nagoya::timeout(

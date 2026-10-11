@@ -8,8 +8,28 @@ use std::{
 
 #[test]
 fn injected_client_and_open_verify_the_chain_and_hostname() {
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    let error = Client::new().unwrap_err();
+    assert!(matches!(error, nago_http::Error::Tls(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("host must call CryptoProvider::install_default")
+    );
+    let target = Target::pinned(
+        "localhost",
+        443,
+        &[std::net::Ipv4Addr::LOCALHOST.into()],
+        true,
+    )
+    .unwrap();
+    let reactor = nagoya::reactor::Reactor::local().unwrap();
+    let result =
+        nagoya::reactor::block_on_with(&reactor, nago_http::open(&target, &reactor.handle()));
+    assert!(matches!(result, Err(nago_http::Error::Tls(_))));
+
     let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(ps_rustcrypto::provider());
     let cert = identity.cert.der().clone();
     let server = Arc::new(
         rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -92,4 +112,7 @@ fn injected_client_and_open_verify_the_chain_and_hostname() {
         drop(result);
         worker.join().unwrap();
     }
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    ps_rustcrypto::provider().install_default().unwrap();
+    assert!(Client::new().is_ok());
 }
