@@ -6,8 +6,11 @@
 //! `chunked`, and nothing else. Those callers send a request now and then, not
 //! a stream of them, so connection reuse would be complexity bought for nothing.
 //!
-//! TLS is nago-rustls, which is rustls on `ring`, trusting the webpki roots.
-//! No tokio, no OpenSSL, no C.
+//! TLS is nago-rustls with the process-default rustls provider selected by the
+//! host and webpki roots on default paths. Default HTTPS first verifies ECC
+//! chains and can retry one new connection with verify-only RSA-PSS after a
+//! matching handshake refusal. Caller-supplied configs stay in force, and the
+//! library never installs a provider. No tokio, no OpenSSL, no C.
 //!
 //! ```no_run
 //! use nagoya::reactor::{Reactor, block_on_with};
@@ -310,54 +313,105 @@ pub(crate) fn require_crypto_provider() -> Result<(), Error> {
 }
 
 /// Establish TCP and, when selected by the target, complete the TLS handshake.
-/// Default TLS requires a process-default crypto provider installed by the host.
-/// This dials only the addresses stored in `target` and never resolves its host.
+/// Default HTTPS requires the host's process-default provider. It first uses
+/// ECC-only verification and opens one new connection with verify-only
+/// RSA-PSS when the handshake error matches the fallback policy. This dials
+/// only the addresses stored in `target` and never resolves its host.
 pub async fn open(target: &Target, handle: &Handle) -> Result<Connection, Error> {
     open_with_tls_config(target, handle, None).await
 }
 
 /// Open with the caller's TLS policy. `None` uses the host's process-default
-/// provider and default roots; missing providers return a TLS error. Plain TCP
-/// and supplied configurations do not require a process-default provider.
+/// provider and default roots, with one RSA-PSS retry for matching handshake
+/// errors. Supplied configs are used as provided, with no verifier retry. Plain
+/// TCP and supplied configs do not require a process-default provider.
 pub async fn open_with_tls_config(
     target: &Target,
     handle: &Handle,
     tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
 ) -> Result<Connection, Error> {
-    if target.tls && tls_config.is_none() {
-        require_crypto_provider()?;
+    if !target.tls {
+        let stream = connect_any(&target.addrs, handle)
+            .await
+            .map_err(|err| Error::Connect(format!("{}: {err}", target.host)))?;
+        return Ok(Connection {
+            stream: ConnectionStream::Plain(stream),
+            host: target.host.clone(),
+            host_header: target.host_header(),
+        });
     }
-    let name = if target.tls {
-        Some(
-            ServerName::try_from(target.host.clone())
-                .map_err(|_| Error::Tls(format!("invalid server name {}", target.host)))?,
-        )
-    } else {
-        None
-    };
-    let session = name
-        .map(|name| {
-            ClientConnection::new(
-                tls_config.unwrap_or_else(nago_rustls::default_client_config),
-                name,
+
+    if let Some(tls_config) = tls_config {
+        return open_tls_with_config(target, handle, tls_config)
+            .await
+            .map_err(|(error, _)| error);
+    }
+
+    require_crypto_provider()?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // ClientConfig::builder uses the host's process-default provider. The
+    // ECC-only verifier uses ps-rustcrypto's provider for certificate checks.
+    let verifier = ps_rustcrypto::policy::EccOnlyVerifier::new(roots.clone())
+        .map_err(|err| Error::Tls(err.to_string()))?;
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    match open_tls_with_config(target, handle, std::sync::Arc::new(config)).await {
+        Ok(connection) => Ok(connection),
+        Err((error, false)) => Err(error),
+        Err((_, true)) => {
+            let verifier = ps_rustcrypto::fallback::rsa_fallback_ct_verifier(
+                roots.clone(),
+                roots,
             )
-            .map_err(|err| Error::Tls(err.to_string()))
-        })
-        .transpose()?;
+            .map_err(|err| Error::Tls(err.to_string()))?;
+            let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                ps_rustcrypto::provider_with_rsa_pss(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|err| Error::Tls(err.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+            open_tls_with_config(target, handle, std::sync::Arc::new(config))
+                .await
+                .map_err(|(error, _)| error)
+        }
+    }
+}
+
+async fn open_tls_with_config(
+    target: &Target,
+    handle: &Handle,
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
+) -> Result<Connection, (Error, bool)> {
+    let name = ServerName::try_from(target.host.clone())
+        .map_err(|_| {
+            (
+                Error::Tls(format!("invalid server name {}", target.host)),
+                false,
+            )
+        })?;
+    let session = ClientConnection::new(tls_config, name)
+        .map_err(|err| (Error::Tls(err.to_string()), false))?;
     let stream = connect_any(&target.addrs, handle)
         .await
-        .map_err(|err| Error::Connect(format!("{}: {err}", target.host)))?;
-    let stream = if let Some(session) = session {
-        let mut tls = TlsSession::client(stream, session);
-        tls.handshake()
-            .await
-            .map_err(|err| Error::Tls(format!("handshake with {}: {err:?}", target.host)))?;
-        ConnectionStream::Tls(tls)
-    } else {
-        ConnectionStream::Plain(stream)
-    };
+        .map_err(|err| (Error::Connect(format!("{}: {err}", target.host)), false))?;
+    let mut tls = TlsSession::client(stream, session);
+    if let Err(err) = tls.handshake().await {
+        let retry = tls
+            .tls_error()
+            .is_some_and(ps_rustcrypto::fallback::wants_rsa_fallback);
+        return Err((
+            Error::Tls(format!("handshake with {}: {err:?}", target.host)),
+            retry,
+        ));
+    }
     Ok(Connection {
-        stream,
+        stream: ConnectionStream::Tls(tls),
         host: target.host.clone(),
         host_header: target.host_header(),
     })

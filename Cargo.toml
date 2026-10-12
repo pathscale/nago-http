@@ -1,6 +1,6 @@
 [package]
 name = "nago-http"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A small HTTP/1.1 client over nagoya and nago-rustls. No tokio, no OpenSSL, no C"
@@ -12,7 +12,12 @@ categories = ["network-programming", "web-programming::http-client"]
 [dependencies]
 nagoya = { version = "^0.1", features = ["reactor"] }
 nago-rustls = "^0.1"
+ps-rustcrypto = {
+    version = "^0.4",
+    default-features = false,
+    features = ["std", "tls12", "zeroize", "rsa-pss"],
+}
+webpki-roots = "^1"
 
 [dev-dependencies]
-ps-rustcrypto = { version = "^0.3", default-features = false, features = ["std", "tls12", "zeroize"] }
 rcgen = "0.14"

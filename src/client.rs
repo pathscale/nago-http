@@ -54,7 +54,9 @@ impl Client {
     /// Start a client and its reactor thread.
     ///
     /// Requires a process-default rustls crypto provider installed by the host.
-    /// Returns a TLS error when none is installed, before starting the reactor.
+    /// Default HTTPS uses it for an ECC-only first connection and can open one
+    /// RSA-PSS verification retry for a matching handshake refusal. Returns a
+    /// TLS error when no provider is installed, before starting the reactor.
     pub fn new() -> Result<Self, Error> {
         crate::require_crypto_provider()?;
         Self::start(None)
@@ -85,9 +87,10 @@ impl Client {
         Ok(CLIENT.get_or_init(|| client))
     }
 
-    /// Start a client with the caller's TLS policy. HTTPS never substitutes
-    /// the default roots when this configuration is supplied. No process-default
-    /// provider is required: this configuration already carries its provider.
+    /// Start a client with the caller's TLS policy. HTTPS uses this
+    /// configuration as supplied and returns handshake errors without retrying
+    /// with another verifier. No process-default provider is required: this
+    /// configuration already carries its provider.
     pub fn with_tls_config(
         config: std::sync::Arc<nago_rustls::rustls::ClientConfig>,
     ) -> Result<Self, Error> {

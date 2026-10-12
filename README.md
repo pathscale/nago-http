@@ -14,13 +14,19 @@ without adding system or default WebPKI roots. The URL hostname remains the SNI
 and certificate verification name, including for pinned socket addresses. The
 original constructors keep their default roots for other consumers.
 
-Version 0.1.4 leaves provider selection to the host. Before `Client::new`,
+Version 0.1.5 leaves provider selection to the host. Before `Client::new`,
 `Client::global`, or default HTTPS through `open`/`send`, the binary must
 install its chosen rustls `CryptoProvider` with `install_default()`.
 These APIs check `CryptoProvider::get_default()` and return `Error::Tls`
 with an installation instruction if no process default exists. They never
-enable or install a provider through crate features. Plain TCP through
-`open`/`send` and explicitly supplied TLS configs need no process default.
+enable or install a provider through crate features. Default HTTPS first uses
+an ECC-only verifier with the process-default provider. If the handshake error
+matches the RSA fallback policy, the client opens one new connection with
+verify-only RSA-PSS and Certificate Transparency checks for publicly trusted
+roots. Other failures are returned without retry. A caller-supplied
+`ClientConfig` is used as supplied and never receives verifier fallback. Plain
+TCP through `open`/`send` and explicitly supplied TLS configs need no process
+default.
 
 Most callers want a `Client`: requests by URL, from any executor. It runs its own
 reactor on a thread of its own, resolves each host once, and gives every request
