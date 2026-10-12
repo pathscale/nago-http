@@ -363,11 +363,8 @@ pub async fn open_with_tls_config(
         Ok(connection) => Ok(connection),
         Err((error, false)) => Err(error),
         Err((_, true)) => {
-            let verifier = ps_rustcrypto::fallback::rsa_fallback_ct_verifier(
-                roots.clone(),
-                roots,
-            )
-            .map_err(|err| Error::Tls(err.to_string()))?;
+            let verifier = ps_rustcrypto::fallback::rsa_fallback_ct_verifier(roots.clone(), roots)
+                .map_err(|err| Error::Tls(err.to_string()))?;
             let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
                 ps_rustcrypto::provider_with_rsa_pss(),
             ))
@@ -388,13 +385,12 @@ async fn open_tls_with_config(
     handle: &Handle,
     tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> Result<Connection, (Error, bool)> {
-    let name = ServerName::try_from(target.host.clone())
-        .map_err(|_| {
-            (
-                Error::Tls(format!("invalid server name {}", target.host)),
-                false,
-            )
-        })?;
+    let name = ServerName::try_from(target.host.clone()).map_err(|_| {
+        (
+            Error::Tls(format!("invalid server name {}", target.host)),
+            false,
+        )
+    })?;
     let session = ClientConnection::new(tls_config, name)
         .map_err(|err| (Error::Tls(err.to_string()), false))?;
     let stream = connect_any(&target.addrs, handle)
