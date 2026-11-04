@@ -8,11 +8,6 @@ name: Publish
 # copying a sibling, or the workflow silently never runs and the release looks
 # like it worked.
 on:
-  push:
-    branches: [master]
-    paths: ['Cargo.toml']
-  # A release that was merged before this gate was fixed has no Cargo.toml
-  # change left to make, so it cannot be triggered by the push rule alone.
   workflow_dispatch:
 
 jobs:
