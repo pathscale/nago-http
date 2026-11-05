@@ -302,6 +302,9 @@ struct Url<'a> {
 
 impl<'a> Url<'a> {
     fn parse(url: &'a str) -> Result<Self, Error> {
+        if url.contains('#') || url.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+            return Err(Error::Url("invalid URL characters".into()));
+        }
         // Only the scheme and host are named in errors: the path and query can
         // carry credentials.
         let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
