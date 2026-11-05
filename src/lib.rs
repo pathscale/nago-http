@@ -161,7 +161,7 @@ impl Target {
 }
 
 /// One request. Build with [`Request::get`] or [`Request::post`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Request<'a> {
     method: &'a str,
     path: &'a str,
@@ -247,11 +247,23 @@ impl<'a> Request<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Request<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Response").field("status", &self.status).finish_non_exhaustive()
+    }
 }
 
 impl Response {
