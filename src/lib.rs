@@ -572,13 +572,19 @@ fn parse_response_with_limit(
         };
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() || chunked {
+                return Err(protocol("ambiguous response framing"));
+            }
             content_length = Some(
                 value
                     .parse::<usize>()
-                    .map_err(|_| Error::Protocol(format!("bad Content-Length: {value}")))?,
+                    .map_err(|_| protocol("invalid Content-Length"))?,
             );
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = value.to_ascii_lowercase().contains("chunked");
+            if chunked || content_length.is_some() || !value.eq_ignore_ascii_case("chunked") {
+                return Err(protocol("unsupported response framing"));
+            }
+            chunked = true;
         }
         headers.push((name.to_string(), value.to_string()));
     }
