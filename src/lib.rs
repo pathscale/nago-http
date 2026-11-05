@@ -484,10 +484,7 @@ async fn exchange<S: Stream>(
             });
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if max_body.is_none() && buffer.len() > MAX_RESPONSE {
-            return Err(Error::TooLarge);
-        }
-        if max_body.is_some() && response_headers_too_large(&buffer) {
+        if buffer.len() > MAX_RESPONSE {
             return Err(Error::TooLarge);
         }
     }
@@ -618,13 +615,22 @@ fn decode_chunked(mut input: &[u8], cap: Option<usize>) -> Result<Option<Vec<u8>
     }
     loop {
         let Some(line_end) = find(input, b"\r\n") else {
+            if input.len() > 1024 {
+                return Err(Error::TooLarge);
+            }
             return Ok(None);
         };
+        if line_end > 1024 {
+            return Err(Error::TooLarge);
+        }
         let size_field = std::str::from_utf8(&input[..line_end])
             .map_err(|_| Error::Protocol("chunk size is not UTF-8".to_string()))?;
         let size_hex = size_field.split(';').next().unwrap_or_default().trim();
         let size = usize::from_str_radix(size_hex, 16)
             .map_err(|_| Error::Protocol(format!("bad chunk size: {size_field}")))?;
+        if size > MAX_RESPONSE || size.checked_add(2).is_none() {
+            return Err(Error::TooLarge);
+        }
         input = &input[line_end + 2..];
         if size == 0 {
             // Trailers are not read; the terminator is enough.
