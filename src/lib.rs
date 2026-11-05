@@ -428,6 +428,34 @@ pub struct Connection {
 impl Connection {
     /// Send one request, read one response, and consume the connection.
     pub async fn send(self, request: Request<'_>) -> Result<Response, Error> {
+        let token = |s: &str| {
+            !s.is_empty()
+                && s.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+                })
+        };
+        let value = |s: &str| {
+            s.bytes()
+                .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+        };
+        if !token(request.method)
+            || !request.path.starts_with('/')
+            || request.path.contains(['#', '\\'])
+            || !request.path.bytes().all(|b| (0x21..=0x7e).contains(&b))
+            || !value(&self.host_header)
+            || request.headers.iter().any(|(name, val)| {
+                !token(name)
+                    || !value(val)
+                    || ["host", "connection", "content-length", "transfer-encoding"]
+                        .iter()
+                        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            })
+            || request
+                .body
+                .is_some_and(|(content_type, _)| !value(content_type))
+        {
+            return Err(Error::Protocol("invalid request head".into()));
+        }
         let bytes = request.encode(&self.host_header);
         let head = request.method.eq_ignore_ascii_case("HEAD");
         match self.stream {
