@@ -12,6 +12,11 @@ fn put_writes_a_large_body_to_a_slow_reader() {
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
     let address = listener.local_addr().expect("listener address");
+    let _ = ps_rustcrypto::provider().install_default();
+    let client = Client::new()
+        .expect("client")
+        .with_timeout(Duration::from_secs(10));
+
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept client");
         stream
@@ -64,9 +69,6 @@ fn put_writes_a_large_body_to_a_slow_reader() {
         received
     });
 
-    let client = Client::new()
-        .expect("client")
-        .with_timeout(Duration::from_secs(10));
     let body = vec![0xA5; BODY_SIZE];
     let url = format!("http://{address}/snapshot");
     let response =
