@@ -536,8 +536,8 @@ enum BodyFraming {
 
 /// Per-exchange parser. All offsets are absolute positions in the append-only wire buffer.
 struct ResponseParser {
+    head_start: usize,
     head_scan: usize,
-    head_end: Option<usize>,
     status: u16,
     headers: Vec<(String, String)>,
     body_start: usize,
@@ -548,6 +548,7 @@ struct ResponseParser {
     chunk_cursor: usize,
     chunk_payload_end: Option<usize>,
     chunk_suffix_pending: bool,
+    trailers_pending: bool,
     #[cfg(test)]
     delimiter_candidates: usize,
     #[cfg(test)]
@@ -559,8 +560,8 @@ struct ResponseParser {
 impl ResponseParser {
     fn new(max_body: Option<usize>) -> Self {
         Self {
+            head_start: 0,
             head_scan: 0,
-            head_end: None,
             status: 0,
             headers: Vec::new(),
             body_start: 0,
@@ -571,6 +572,7 @@ impl ResponseParser {
             chunk_cursor: 0,
             chunk_payload_end: None,
             chunk_suffix_pending: false,
+            trailers_pending: false,
             #[cfg(test)]
             delimiter_candidates: 0,
             #[cfg(test)]
@@ -587,14 +589,14 @@ impl ResponseParser {
         head_request: bool,
     ) -> Result<Option<Response>, Error> {
         let protocol = |detail: &str| Error::Protocol(detail.to_string());
-        if self.head_end.is_none() {
-            let (head_end, scanned) = find_from(buffer, b"\r\n\r\n", &mut self.head_scan, 3, 0);
+        while self.framing.is_none() {
+            let (head_end, scanned) =
+                find_from(buffer, b"\r\n\r\n", &mut self.head_scan, 3, self.head_start);
             #[cfg(test)]
             {
                 self.delimiter_candidates += scanned;
             }
             if let Some(end) = head_end {
-                self.head_end = Some(end);
                 self.parse_head(buffer, end, head_request)?;
             } else {
                 if at_eof {
@@ -645,44 +647,80 @@ impl ResponseParser {
         head_request: bool,
     ) -> Result<(), Error> {
         let protocol = |detail: &str| Error::Protocol(detail.to_string());
-        let head = std::str::from_utf8(&buffer[..head_end])
+        let head = std::str::from_utf8(&buffer[self.head_start..head_end])
             .map_err(|_| protocol("headers are not UTF-8"))?;
         let mut lines = head.split("\r\n");
         let status_line = lines.next().unwrap_or_default();
-        self.status = status_line
-            .split(' ')
-            .nth(1)
-            .and_then(|code| code.parse::<u16>().ok())
-            .ok_or_else(|| Error::Protocol(format!("bad status line: {status_line}")))?;
+        let mut status_parts = status_line.splitn(3, ' ');
+        let version = status_parts.next().unwrap_or_default();
+        let code = status_parts.next().unwrap_or_default();
+        let reason = status_parts.next();
+        if !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+            || code.len() != 3
+            || !code.bytes().all(|byte| byte.is_ascii_digit())
+            || reason.is_none()
+            || !reason.unwrap_or_default().bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+        {
+            return Err(protocol("malformed HTTP/1.x status line"));
+        }
+        let status = code.parse::<u16>().map_err(|_| protocol("invalid status code"))?;
+        if !(100..=599).contains(&status) {
+            return Err(protocol("status code is outside the HTTP range"));
+        }
+        if status == 101 {
+            return Err(protocol("switching protocols is unsupported"));
+        }
+        let interim = status < 200;
         let mut content_length = None;
         let mut chunked = false;
         for line in lines {
             let Some((name, value)) = line.split_once(':') else {
-                continue;
+                return Err(protocol("malformed response header"));
             };
-            let value = value.trim();
+            if !is_http_token(name)
+                || !value.bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+            {
+                return Err(protocol("malformed response header"));
+            }
+            let framing_value = value.trim_matches([' ', '\t']);
             if name.eq_ignore_ascii_case("content-length") {
                 if content_length.is_some() || chunked {
                     return Err(protocol("ambiguous response framing"));
                 }
+                if framing_value.is_empty() || !framing_value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(protocol("invalid Content-Length"));
+                }
                 content_length = Some(
-                    value
+                    framing_value
                         .parse::<usize>()
                         .map_err(|_| protocol("invalid Content-Length"))?,
                 );
             } else if name.eq_ignore_ascii_case("transfer-encoding") {
-                if chunked || content_length.is_some() || !value.eq_ignore_ascii_case("chunked") {
+                if version == "HTTP/1.0" {
+                    return Err(protocol("Transfer-Encoding on HTTP/1.0 response"));
+                }
+                if chunked || content_length.is_some() || !framing_value.eq_ignore_ascii_case("chunked") {
                     return Err(protocol("unsupported response framing"));
                 }
                 chunked = true;
             }
-            self.headers.push((name.to_string(), value.to_string()));
+            if !interim {
+                self.headers.push((name.to_string(), value.trim().to_string()));
+            }
         }
+        #[cfg(test)]
+        {
+            self.head_parses += 1;
+        }
+        if interim {
+            self.head_start = head_end + 4;
+            return Ok(());
+        }
+        self.status = status;
         self.body_start = head_end + 4;
         self.chunk_cursor = self.body_start;
         self.chunk_scan = self.body_start;
         let bodiless = head_request
-            || (100..200).contains(&self.status)
             || self.status == 204
             || self.status == 304;
         self.framing = Some(if bodiless {
@@ -694,10 +732,6 @@ impl ResponseParser {
         } else {
             BodyFraming::CloseDelimited
         });
-        #[cfg(test)]
-        {
-            self.head_parses += 1;
-        }
         Ok(())
     }
 
@@ -708,15 +742,51 @@ impl ResponseParser {
         }
         loop {
             if self.chunk_suffix_pending {
-                if buffer.len() < self.chunk_cursor.saturating_add(2) {
+                let suffix_end = self.chunk_cursor.saturating_add(2);
+                if buffer.len() < suffix_end {
                     if at_eof {
                         return Err(protocol("connection closed inside a chunked body"));
                     }
                     return Ok(None);
                 }
-                self.chunk_cursor += 2;
+                if &buffer[self.chunk_cursor..suffix_end] != b"\r\n" {
+                    return Err(protocol("chunk data is not followed by CRLF"));
+                }
+                self.chunk_cursor = suffix_end;
                 self.chunk_suffix_pending = false;
                 self.chunk_scan = self.chunk_cursor;
+            }
+            if self.trailers_pending {
+                let line_start = self.chunk_cursor;
+                let (line_end, scanned) = find_from(buffer, b"\r\n", &mut self.chunk_scan, 1, line_start);
+                #[cfg(test)]
+                { self.delimiter_candidates += scanned; }
+                check_chunk_line_limit(buffer, line_start, line_end)?;
+                let Some(line_end) = line_end else {
+                    if at_eof { return Err(protocol("connection closed before chunk trailers ended")); }
+                    return Ok(None);
+                };
+                if line_end == line_start {
+                    let body = std::mem::take(&mut self.body);
+                    return Ok(Some(self.response(body)));
+                }
+                let line = std::str::from_utf8(&buffer[line_start..line_end])
+                    .map_err(|_| protocol("chunk trailer is not UTF-8"))?;
+                let Some((name, value)) = line.split_once(':') else {
+                    return Err(protocol("malformed chunk trailer"));
+                };
+                if !is_http_token(name)
+                    || !value.bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+                    || ["content-length", "transfer-encoding", "host"]
+                        .iter().any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+                {
+                    return Err(protocol("malformed or forbidden chunk trailer"));
+                }
+                // Validate and consume trailers without promoting them into the
+                // original header block (which callers may use for policy).
+                self.chunk_cursor = line_end + 2;
+                self.chunk_scan = self.chunk_cursor;
+                continue;
             }
             if let Some(end) = self.chunk_payload_end {
                 if let Some(cap) = self.cap {
@@ -757,31 +827,23 @@ impl ResponseParser {
             {
                 self.delimiter_candidates += scanned;
             }
+            check_chunk_line_limit(buffer, line_start, line_end)?;
             let Some(line_end) = line_end else {
-                if buffer.len().saturating_sub(line_start) > 1024 {
-                    return Err(Error::TooLarge);
-                }
                 if at_eof {
                     return Err(protocol("connection closed inside a chunked body"));
                 }
                 return Ok(None);
             };
-            if line_end.saturating_sub(line_start) > 1024 {
-                return Err(Error::TooLarge);
-            }
-            let size_field = std::str::from_utf8(&buffer[line_start..line_end])
-                .map_err(|_| Error::Protocol("chunk size is not UTF-8".to_string()))?;
-            let size_hex = size_field.split(';').next().unwrap_or_default().trim();
-            let size = usize::from_str_radix(size_hex, 16)
-                .map_err(|_| Error::Protocol(format!("bad chunk size: {size_field}")))?;
+            let size = parse_chunk_size(&buffer[line_start..line_end])
+                .ok_or_else(|| protocol("invalid chunk size or extension"))?;
             if size > MAX_RESPONSE || size.checked_add(2).is_none() {
                 return Err(Error::TooLarge);
             }
             self.chunk_cursor = line_end + 2;
             self.chunk_scan = self.chunk_cursor;
             if size == 0 {
-                let body = std::mem::take(&mut self.body);
-                return Ok(Some(self.response(body)));
+                self.trailers_pending = true;
+                continue;
             }
             self.chunk_payload_end = self.chunk_cursor.checked_add(size);
             if self.chunk_payload_end.is_none() {
@@ -805,6 +867,72 @@ impl ResponseParser {
             body,
         }
     }
+}
+
+fn check_chunk_line_limit(buffer: &[u8], start: usize, end: Option<usize>) -> Result<(), Error> {
+    let length = if let Some(end) = end {
+        end - start
+    } else {
+        let pending = &buffer[start..];
+        // A final CR may be the first byte of the line delimiter.
+        pending.strip_suffix(b"\r").unwrap_or(pending).len()
+    };
+    if length > 1024 {
+        return Err(Error::TooLarge);
+    }
+    Ok(())
+}
+
+fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    let hex_end = line
+        .iter()
+        .position(|byte| !byte.is_ascii_hexdigit())
+        .unwrap_or(line.len());
+    let size = usize::from_str_radix(std::str::from_utf8(&line[..hex_end]).ok()?, 16).ok()?;
+
+    let mut extension = line[hex_end..].iter().copied().peekable();
+    let is_space = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let is_token = |byte: &u8| is_http_token_byte(*byte);
+    while extension.peek().is_some() {
+        while extension.next_if(is_space).is_some() {}
+        extension.next_if_eq(&b';')?;
+        while extension.next_if(is_space).is_some() {}
+        extension.next_if(is_token)?;
+        while extension.next_if(is_token).is_some() {}
+
+        // Whitespace after a name belongs to the following '=' or ';'.
+        let had_space = extension.next_if(is_space).is_some();
+        while extension.next_if(is_space).is_some() {}
+        if extension.next_if_eq(&b'=').is_some() {
+            while extension.next_if(is_space).is_some() {}
+            if extension.next_if_eq(&b'"').is_some() {
+                loop {
+                    let byte = match extension.next()? {
+                        b'"' => break,
+                        b'\\' => extension.next()?,
+                        byte => byte,
+                    };
+                    if byte != b'\t' && (byte < b' ' || byte == 0x7f) {
+                        return None;
+                    }
+                }
+            } else {
+                extension.next_if(is_token)?;
+                while extension.next_if(is_token).is_some() {}
+            }
+        } else if had_space && extension.peek().is_none() {
+            return None;
+        }
+    }
+    Some(size)
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_http_token_byte)
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_|~".contains(&byte) || byte == 0x60
 }
 
 fn find_from(
@@ -1127,6 +1255,8 @@ mod tests {
         wire.extend_from_slice(b"3\r\na\r\n");
         assert!(parser.advance(&wire, false, false).unwrap().is_none());
         wire.extend_from_slice(b"\r\n0\r\n");
+        assert!(parser.advance(&wire, false, false).unwrap().is_none());
+        wire.extend_from_slice(b"\r\n");
         assert_eq!(
             parser.advance(&wire, false, false).unwrap().unwrap().body,
             b"a\r\n"
@@ -1176,10 +1306,121 @@ mod tests {
     }
 
     #[test]
+    fn strict_response_framing_rejects_bad_suffix_and_trailers() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let bad_suffix = [head.as_slice(), b"1\r\nxX0\r\n\r\n"].concat();
+        assert!(matches!(parse_response(&bad_suffix, false, false), Err(Error::Protocol(_))));
+
+        let incomplete = [head.as_slice(), b"0\r\nX-End: yes\r\n"].concat();
+        assert!(parse_response(&incomplete, false, false).unwrap().is_none());
+        assert!(matches!(parse_response(&incomplete, true, false), Err(Error::Protocol(_))));
+
+        let malformed = [head.as_slice(), b"0\r\nnot-a-field\r\n\r\n"].concat();
+        assert!(matches!(parse_response(&malformed, false, false), Err(Error::Protocol(_))));
+
+        let valid = [head.as_slice(), b"1\r\nx\r\n0\r\nX-End: yes\r\n\r\n"].concat();
+        let response = parse_response(&valid, false, false).unwrap().unwrap();
+        assert_eq!(response.body, b"x");
+        assert_eq!(response.header("x-end"), None);
+    }
+
+    #[test]
+    fn strict_response_status_line_rejects_invalid_version_and_upgrade() {
+        for raw in [
+            &b"HTTP/9.9 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 101 Switching Protocols\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+        ] {
+            assert!(matches!(parse_response(raw, false, false), Err(Error::Protocol(_))));
+        }
+        let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(parse_response(valid, false, false).unwrap().unwrap().body, b"ok");
+        let legacy = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(parse_response(legacy, false, false).unwrap().unwrap().body, b"ok");
+    }
+
+    #[test]
+    fn informational_heads_are_consumed_before_the_final_response() {
+        let interim = b"HTTP/1.1 100 Continue\r\nX-First: interim\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n";
+        let final_response = b"HTTP/1.1 200 OK\r\nX-First: final\r\nContent-Length: 2\r\n\r\nok";
+        let raw = [interim.as_slice(), final_response.as_slice()].concat();
+
+        let mut parser = ResponseParser::new(None);
+        for end in 1..raw.len() {
+            assert!(parser.advance(&raw[..end], false, false).unwrap().is_none());
+        }
+        let fragmented = parser.advance(&raw, false, false).unwrap().unwrap();
+        let coalesced = parse_response(&raw, false, false).unwrap().unwrap();
+        for response in [fragmented, coalesced] {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"ok");
+            assert_eq!(response.header("x-first"), Some("final"));
+            assert_eq!(response.header("link"), None);
+            assert_eq!(response.headers.len(), 2);
+        }
+        assert_eq!(parser.head_start, interim.len());
+        assert_eq!(parser.head_parses, 3);
+        assert!(parser.delimiter_candidates <= raw.len());
+        assert!(parse_response_with_limit(interim, false, false, Some(0))
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            parse_response(interim, true, false),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn http_10_rejects_transfer_encoding_and_accepts_close_delimiting() {
+        let chunked = b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        assert!(matches!(
+            parse_response(chunked, false, false),
+            Err(Error::Protocol(_))
+        ));
+
+        let close = b"HTTP/1.0 200 OK\r\n\r\nok";
+        assert!(parse_response(close, false, false).unwrap().is_none());
+        assert_eq!(parse_response(close, true, false).unwrap().unwrap().body, b"ok");
+    }
+
+    #[test]
+    fn framing_values_require_http_numeric_and_extension_syntax() {
+        for value in ["+1", "-1", "", "\u{a0}1", "1\u{a0}", "\u{FF11}", "1 0"] {
+            let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {value}\r\n\r\nx");
+            assert!(matches!(
+                parse_response(raw.as_bytes(), false, false),
+                Err(Error::Protocol(_))
+            ), "accepted Content-Length {value:?}");
+        }
+        let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: \t01\t \r\n\r\nx";
+        assert_eq!(parse_response(fixed, false, false).unwrap().unwrap().body, b"x");
+
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for line in [
+            "+1", "-1", "", " 1", "\u{a0}1", "1\u{a0}", "0x1", "1 ",
+            "1;", "1;=yes", "1;ext=", "1;ext=a b", "1;ext ", "1;ext=ok ",
+            "1;ext=\"unterminated", "1;ext=\"a\\", "1;ext=\"a\"extra",
+            "1;ext=a\nb", "1;ext=\"a\rb\"", "1;ext=\"a\\\nb\"",
+            "1;ext=\"a\x7fb\"",
+        ] {
+            let raw = [head.as_slice(), line.as_bytes(), b"\r\nx\r\n0\r\n\r\n"].concat();
+            assert!(matches!(
+                parse_response(&raw, false, false),
+                Err(Error::Protocol(_))
+            ), "accepted chunk line {line:?}");
+        }
+        let valid = b"1 \t; flag ; ext \t= \t\"a;\\\"b\\\\c\";word=abc\r\nx\r\n0;last=\"\"\r\n\r\n";
+        let raw = [head.as_slice(), valid.as_slice()].concat();
+        assert_eq!(parse_response(&raw, false, false).unwrap().unwrap().body, b"x");
+    }
+
+    #[test]
     fn wire_limit_is_checked_before_prefix_parsing() {
-        let placeholder = b"HTTP/1.1 200 OK\r\nContent-Length: 00000000\r\n\r\n";
+        let interim = "HTTP/1.1 103 Early Hints\r\n\r\n";
+        let placeholder = format!("{interim}HTTP/1.1 200 OK\r\nContent-Length: 00000000\r\n\r\n");
         let body_len = MAX_RESPONSE - placeholder.len();
-        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len:08}\r\n\r\n").into_bytes();
+        let head = format!("{interim}HTTP/1.1 200 OK\r\nContent-Length: {body_len:08}\r\n\r\n").into_bytes();
         assert_eq!(head.len(), placeholder.len());
         let mut exact_wire = head.clone();
         exact_wire.resize(MAX_RESPONSE, b'x');
@@ -1215,6 +1456,42 @@ mod tests {
             Err(Error::TooLarge)
         ));
     }
+    #[test]
+    fn chunk_line_limits_are_independent_of_delimiter_fragmentation() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for (prefix, line_prefix, suffix) in [
+            (&b""[..], &b"1;ext="[..], &b"x\r\n0\r\n\r\n"[..]),
+            (&b"0\r\n"[..], &b"X-Trailer:"[..], &b"\r\n"[..]),
+        ] {
+            for length in [1024, 1025] {
+                let mut raw = [head.as_slice(), prefix, line_prefix].concat();
+                raw.resize(head.len() + prefix.len() + length, b'a');
+                let line_end = raw.len();
+                raw.extend_from_slice(b"\r\n");
+                raw.extend_from_slice(suffix);
+
+                let mut parser = ResponseParser::new(None);
+                let before_cr = parser.advance(&raw[..line_end], false, false);
+                let mut parser_at_cr = ResponseParser::new(None);
+                let after_cr = parser_at_cr.advance(&raw[..line_end + 1], false, false);
+                let coalesced = parse_response(&raw, false, false);
+                if length == 1024 {
+                    assert!(before_cr.unwrap().is_none());
+                    assert!(parser.advance(&raw[..line_end + 1], false, false).unwrap().is_none());
+                    assert!(after_cr.unwrap().is_none());
+                    let fragmented = parser.advance(&raw, false, false).unwrap().unwrap();
+                    let coalesced = coalesced.unwrap().unwrap();
+                    assert_eq!(fragmented.body, coalesced.body);
+                    assert_eq!(fragmented.header("x-trailer"), None);
+                } else {
+                    for result in [before_cr, after_cr, coalesced] {
+                        assert!(matches!(result, Err(Error::TooLarge)));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn chunk_size_line_guards_remain_bounded() {
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
