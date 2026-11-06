@@ -1,6 +1,6 @@
 [package]
 name = "nago-http"
-version = "0.1.5"
+version = "0.1.6"
 publish = ["crates-io"]
 
 edition = "2024"
@@ -12,7 +12,7 @@ keywords = ["http", "https", "client", "no-runtime", "nagoya"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-nagoya = { version = "^0.1", features = ["reactor"] }
+nagoya = { version = "0.1.20", features = ["reactor"] }
 nago-rustls = "^0.1.3"
 ps-rustcrypto = {
     version = "^0.4",

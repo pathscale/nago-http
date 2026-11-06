@@ -82,6 +82,10 @@ impl Target {
 
     fn resolve_with(host: &str, port: u16, tls: bool) -> Result<Self, Error> {
         let addrs = resolve(host, port).map_err(|err| Error::Resolve(err.to_string()))?;
+        Self::from_addrs(host, port, tls, addrs)
+    }
+
+    fn from_addrs(host: &str, port: u16, tls: bool, addrs: Vec<Addr>) -> Result<Self, Error> {
         if addrs.is_empty() {
             return Err(Error::Resolve(format!("{host} has no addresses")));
         }
@@ -92,6 +96,33 @@ impl Target {
             tls,
             pinned: false,
         })
+    }
+
+    pub(crate) async fn resolve_until(
+        resolver: &nagoya::resolve::Resolver,
+        host: &str,
+        port: u16,
+        tls: bool,
+        deadline_ns: u64,
+    ) -> Result<Self, Error> {
+        let addrs = resolver
+            .resolve_until(host, port, deadline_ns)
+            .await
+            .map_err(|error| match error {
+                nagoya::resolve::ResolveUntilError::Deadline => {
+                    Error::Timeout(format!("DNS for {host} exceeded the request deadline"))
+                }
+                nagoya::resolve::ResolveUntilError::Busy => Error::Resolve(
+                    "bounded DNS admission is busy".into(),
+                ),
+                nagoya::resolve::ResolveUntilError::Closed => Error::Resolve(
+                    "bounded DNS resolver is unavailable".into(),
+                ),
+                nagoya::resolve::ResolveUntilError::Resolve(error) => {
+                    Error::Resolve(error.to_string())
+                }
+            })?;
+        Self::from_addrs(host, port, tls, addrs)
     }
 
     /// Dial `addrs` at `port`. Do not resolve `host`.
