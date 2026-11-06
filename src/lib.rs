@@ -42,11 +42,11 @@
 
 use core::fmt;
 
-use nago_rustls::TlsSession;
 use nago_rustls::rustls::ClientConnection;
 use nago_rustls::rustls_pki_types::ServerName;
+use nago_rustls::TlsSession;
 use nagoya::io::Stream;
-use nagoya::reactor::{Addr, Handle, TcpStream, connect_any, resolve};
+use nagoya::reactor::{connect_any, resolve, Addr, Handle, TcpStream};
 
 mod client;
 pub use client::{Client, DEFAULT_TIMEOUT};
@@ -262,7 +262,9 @@ impl fmt::Debug for Request<'_> {
 
 impl fmt::Debug for Response {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Response").field("status", &self.status).finish_non_exhaustive()
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
     }
 }
 
@@ -442,14 +444,10 @@ impl Connection {
     pub async fn send(self, request: Request<'_>) -> Result<Response, Error> {
         let token = |s: &str| {
             !s.is_empty()
-                && s.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-                })
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
         };
-        let value = |s: &str| {
-            s.bytes()
-                .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
-        };
+        let value = |s: &str| s.bytes().all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f));
         if !token(request.method)
             || !request.path.starts_with('/')
             || request.path.contains(['#', '\\'])
@@ -509,9 +507,10 @@ async fn exchange<S: Stream>(
         .map_err(|err| Error::Io(format!("writing to {host}: {err:?}")))?;
 
     let mut buffer = Vec::with_capacity(16 * 1024);
+    let mut parser = ResponseParser::new(max_body);
     let mut chunk = [0u8; 16 * 1024];
     loop {
-        if let Some(response) = parse_response_with_limit(&buffer, false, head, max_body)? {
+        if let Some(response) = parser.advance(&buffer, false, head)? {
             return Ok(response);
         }
         let read = stream
@@ -519,23 +518,321 @@ async fn exchange<S: Stream>(
             .await
             .map_err(|err| Error::Io(format!("reading from {host}: {err:?}")))?;
         if read == 0 {
-            return parse_response_with_limit(&buffer, true, head, max_body)?.ok_or_else(|| {
+            return parser.advance(&buffer, true, head)?.ok_or_else(|| {
                 Error::Protocol(format!("{host} closed the connection mid-response"))
             });
         }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > MAX_RESPONSE {
-            return Err(Error::TooLarge);
+        append_wire_bytes(&mut buffer, &chunk[..read])?;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BodyFraming {
+    Bodiless,
+    Fixed(usize),
+    CloseDelimited,
+    Chunked,
+}
+
+/// Per-exchange parser. All offsets are absolute positions in the append-only wire buffer.
+struct ResponseParser {
+    head_scan: usize,
+    head_end: Option<usize>,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_start: usize,
+    framing: Option<BodyFraming>,
+    cap: Option<usize>,
+    body: Vec<u8>,
+    chunk_scan: usize,
+    chunk_cursor: usize,
+    chunk_payload_end: Option<usize>,
+    chunk_suffix_pending: bool,
+    #[cfg(test)]
+    delimiter_candidates: usize,
+    #[cfg(test)]
+    head_parses: usize,
+    #[cfg(test)]
+    payload_appended: usize,
+}
+
+impl ResponseParser {
+    fn new(max_body: Option<usize>) -> Self {
+        Self {
+            head_scan: 0,
+            head_end: None,
+            status: 0,
+            headers: Vec::new(),
+            body_start: 0,
+            framing: None,
+            cap: max_body.map(|limit| limit.min(MAX_RESPONSE)),
+            body: Vec::new(),
+            chunk_scan: 0,
+            chunk_cursor: 0,
+            chunk_payload_end: None,
+            chunk_suffix_pending: false,
+            #[cfg(test)]
+            delimiter_candidates: 0,
+            #[cfg(test)]
+            head_parses: 0,
+            #[cfg(test)]
+            payload_appended: 0,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        buffer: &[u8],
+        at_eof: bool,
+        head_request: bool,
+    ) -> Result<Option<Response>, Error> {
+        let protocol = |detail: &str| Error::Protocol(detail.to_string());
+        if self.head_end.is_none() {
+            let (head_end, scanned) = find_from(buffer, b"\r\n\r\n", &mut self.head_scan, 3, 0);
+            #[cfg(test)]
+            {
+                self.delimiter_candidates += scanned;
+            }
+            if let Some(end) = head_end {
+                self.head_end = Some(end);
+                self.parse_head(buffer, end, head_request)?;
+            } else {
+                if at_eof {
+                    return Err(protocol("connection closed before the headers ended"));
+                }
+                return Ok(None);
+            }
+        }
+        let framing = *self.framing.as_ref().expect("head framing is initialized");
+        match framing {
+            BodyFraming::Bodiless => Ok(Some(self.response(Vec::new()))),
+            BodyFraming::Fixed(length) => {
+                let target = self.cap.map_or(length, |cap| length.min(cap));
+                let available = buffer.len().saturating_sub(self.body_start);
+                if available >= target {
+                    Ok(Some(self.response(
+                        buffer[self.body_start..self.body_start + target].to_vec(),
+                    )))
+                } else if at_eof {
+                    Err(protocol("connection closed before the body ended"))
+                } else {
+                    Ok(None)
+                }
+            }
+            BodyFraming::CloseDelimited => {
+                let available = buffer.len().saturating_sub(self.body_start);
+                if let Some(cap) = self.cap {
+                    if available >= cap {
+                        return Ok(Some(self.response(
+                            buffer[self.body_start..self.body_start + cap].to_vec(),
+                        )));
+                    }
+                }
+                if at_eof {
+                    Ok(Some(self.response(buffer[self.body_start..].to_vec())))
+                } else {
+                    Ok(None)
+                }
+            }
+            BodyFraming::Chunked => self.advance_chunked(buffer, at_eof),
+        }
+    }
+
+    fn parse_head(
+        &mut self,
+        buffer: &[u8],
+        head_end: usize,
+        head_request: bool,
+    ) -> Result<(), Error> {
+        let protocol = |detail: &str| Error::Protocol(detail.to_string());
+        let head = std::str::from_utf8(&buffer[..head_end])
+            .map_err(|_| protocol("headers are not UTF-8"))?;
+        let mut lines = head.split("\r\n");
+        let status_line = lines.next().unwrap_or_default();
+        self.status = status_line
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or_else(|| Error::Protocol(format!("bad status line: {status_line}")))?;
+        let mut content_length = None;
+        let mut chunked = false;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                if content_length.is_some() || chunked {
+                    return Err(protocol("ambiguous response framing"));
+                }
+                content_length = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| protocol("invalid Content-Length"))?,
+                );
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                if chunked || content_length.is_some() || !value.eq_ignore_ascii_case("chunked") {
+                    return Err(protocol("unsupported response framing"));
+                }
+                chunked = true;
+            }
+            self.headers.push((name.to_string(), value.to_string()));
+        }
+        self.body_start = head_end + 4;
+        self.chunk_cursor = self.body_start;
+        self.chunk_scan = self.body_start;
+        let bodiless = head_request
+            || (100..200).contains(&self.status)
+            || self.status == 204
+            || self.status == 304;
+        self.framing = Some(if bodiless {
+            BodyFraming::Bodiless
+        } else if chunked {
+            BodyFraming::Chunked
+        } else if let Some(length) = content_length {
+            BodyFraming::Fixed(length)
+        } else {
+            BodyFraming::CloseDelimited
+        });
+        #[cfg(test)]
+        {
+            self.head_parses += 1;
+        }
+        Ok(())
+    }
+
+    fn advance_chunked(&mut self, buffer: &[u8], at_eof: bool) -> Result<Option<Response>, Error> {
+        let protocol = |detail: &str| Error::Protocol(detail.to_string());
+        if self.cap == Some(0) {
+            return Ok(Some(self.response(Vec::new())));
+        }
+        loop {
+            if self.chunk_suffix_pending {
+                if buffer.len() < self.chunk_cursor.saturating_add(2) {
+                    if at_eof {
+                        return Err(protocol("connection closed inside a chunked body"));
+                    }
+                    return Ok(None);
+                }
+                self.chunk_cursor += 2;
+                self.chunk_suffix_pending = false;
+                self.chunk_scan = self.chunk_cursor;
+            }
+            if let Some(end) = self.chunk_payload_end {
+                if let Some(cap) = self.cap {
+                    let remaining = cap.saturating_sub(self.body.len());
+                    let payload_len = end - self.chunk_cursor;
+                    if payload_len > remaining {
+                        if buffer.len().saturating_sub(self.chunk_cursor) < remaining {
+                            if at_eof {
+                                return Err(protocol("connection closed inside a chunked body"));
+                            }
+                            return Ok(None);
+                        }
+                        self.append_payload(buffer, self.chunk_cursor, remaining);
+                        let body = std::mem::take(&mut self.body);
+                        return Ok(Some(self.response(body)));
+                    }
+                }
+                if buffer.len() < end {
+                    if at_eof {
+                        return Err(protocol("connection closed inside a chunked body"));
+                    }
+                    return Ok(None);
+                }
+                self.append_payload(buffer, self.chunk_cursor, end - self.chunk_cursor);
+                self.chunk_cursor = end;
+                self.chunk_payload_end = None;
+                self.chunk_suffix_pending = true;
+                if self.cap.is_some_and(|cap| self.body.len() == cap) {
+                    let body = std::mem::take(&mut self.body);
+                    return Ok(Some(self.response(body)));
+                }
+                continue;
+            }
+            let line_start = self.chunk_cursor;
+            let (line_end, scanned) =
+                find_from(buffer, b"\r\n", &mut self.chunk_scan, 1, line_start);
+            #[cfg(test)]
+            {
+                self.delimiter_candidates += scanned;
+            }
+            let Some(line_end) = line_end else {
+                if buffer.len().saturating_sub(line_start) > 1024 {
+                    return Err(Error::TooLarge);
+                }
+                if at_eof {
+                    return Err(protocol("connection closed inside a chunked body"));
+                }
+                return Ok(None);
+            };
+            if line_end.saturating_sub(line_start) > 1024 {
+                return Err(Error::TooLarge);
+            }
+            let size_field = std::str::from_utf8(&buffer[line_start..line_end])
+                .map_err(|_| Error::Protocol("chunk size is not UTF-8".to_string()))?;
+            let size_hex = size_field.split(';').next().unwrap_or_default().trim();
+            let size = usize::from_str_radix(size_hex, 16)
+                .map_err(|_| Error::Protocol(format!("bad chunk size: {size_field}")))?;
+            if size > MAX_RESPONSE || size.checked_add(2).is_none() {
+                return Err(Error::TooLarge);
+            }
+            self.chunk_cursor = line_end + 2;
+            self.chunk_scan = self.chunk_cursor;
+            if size == 0 {
+                let body = std::mem::take(&mut self.body);
+                return Ok(Some(self.response(body)));
+            }
+            self.chunk_payload_end = self.chunk_cursor.checked_add(size);
+            if self.chunk_payload_end.is_none() {
+                return Err(Error::TooLarge);
+            }
+        }
+    }
+
+    fn append_payload(&mut self, buffer: &[u8], start: usize, length: usize) {
+        self.body.extend_from_slice(&buffer[start..start + length]);
+        #[cfg(test)]
+        {
+            self.payload_appended += length;
+        }
+    }
+
+    fn response(&self, body: Vec<u8>) -> Response {
+        Response {
+            status: self.status,
+            headers: self.headers.clone(),
+            body,
         }
     }
 }
 
-/// Parse a complete response out of `buffer`, or `None` if more is needed.
-///
-/// `at_eof` says the peer has closed: a body framed by neither length nor
-/// chunking ends there, and one that is framed but short is an error.
-/// `head_request` says the request was HEAD, whose response has no body; 1xx, 204 and 304
-/// never do either (RFC 9112 section 6.3).
+fn find_from(
+    haystack: &[u8],
+    needle: &[u8],
+    cursor: &mut usize,
+    overlap: usize,
+    floor: usize,
+) -> (Option<usize>, usize) {
+    let start = (*cursor).min(haystack.len());
+    if needle.is_empty() {
+        return (Some(start.max(floor)), 0);
+    }
+    let scan_start = start.saturating_sub(overlap).max(floor);
+    let mut scanned = 0;
+    if haystack.len() >= needle.len() && scan_start <= haystack.len() - needle.len() {
+        for i in scan_start..=haystack.len() - needle.len() {
+            scanned += 1;
+            if &haystack[i..i + needle.len()] == needle {
+                *cursor = i + needle.len();
+                return (Some(i), scanned);
+            }
+        }
+    }
+    *cursor = haystack.len();
+    (None, scanned)
+}
+
 #[cfg(test)]
 fn parse_response(
     buffer: &[u8],
@@ -545,170 +842,22 @@ fn parse_response(
     parse_response_with_limit(buffer, at_eof, head_request, None)
 }
 
+#[cfg(test)]
 fn parse_response_with_limit(
     buffer: &[u8],
     at_eof: bool,
     head_request: bool,
     max_body: Option<usize>,
 ) -> Result<Option<Response>, Error> {
-    let protocol = |detail: &str| Error::Protocol(detail.to_string());
-    let Some(head_end) = find(buffer, b"\r\n\r\n") else {
-        if at_eof {
-            return Err(protocol("connection closed before the headers ended"));
-        }
-        return Ok(None);
-    };
-    let head =
-        std::str::from_utf8(&buffer[..head_end]).map_err(|_| protocol("headers are not UTF-8"))?;
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let status = status_line
-        .split(' ')
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| Error::Protocol(format!("bad status line: {status_line}")))?;
-
-    let mut headers = Vec::new();
-    let mut content_length = None;
-    let mut chunked = false;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() || chunked {
-                return Err(protocol("ambiguous response framing"));
-            }
-            content_length = Some(
-                value
-                    .parse::<usize>()
-                    .map_err(|_| protocol("invalid Content-Length"))?,
-            );
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            if chunked || content_length.is_some() || !value.eq_ignore_ascii_case("chunked") {
-                return Err(protocol("unsupported response framing"));
-            }
-            chunked = true;
-        }
-        headers.push((name.to_string(), value.to_string()));
-    }
-
-    let body = &buffer[head_end + 4..];
-    let bodiless = head_request || (100..200).contains(&status) || status == 204 || status == 304;
-    let cap = max_body.map(|limit| limit.min(MAX_RESPONSE));
-    let body = if bodiless {
-        Vec::new()
-    } else if chunked {
-        match decode_chunked(body, cap)? {
-            Some(body) => body,
-            None if at_eof => return Err(protocol("connection closed inside a chunked body")),
-            None => return Ok(None),
-        }
-    } else if let Some(length) = content_length {
-        if let Some(cap) = cap {
-            if body.len() >= cap && length >= cap {
-                body[..cap].to_vec()
-            } else if body.len() < length {
-                if at_eof {
-                    return Err(protocol("connection closed before the body ended"));
-                }
-                return Ok(None);
-            } else {
-                body[..length].to_vec()
-            }
-        } else if body.len() < length {
-            if at_eof {
-                return Err(protocol("connection closed before the body ended"));
-            }
-            return Ok(None);
-        } else {
-            body[..length].to_vec()
-        }
-    } else if let Some(cap) = cap {
-        if body.len() >= cap {
-            body[..cap].to_vec()
-        } else if at_eof {
-            body.to_vec()
-        } else {
-            return Ok(None);
-        }
-    } else if at_eof {
-        body.to_vec()
-    } else {
-        return Ok(None);
-    };
-    Ok(Some(Response {
-        status,
-        headers,
-        body,
-    }))
+    ResponseParser::new(max_body).advance(buffer, at_eof, head_request)
 }
 
-/// Decode a chunked body, or `None` if the terminating chunk or requested
-/// decoded body prefix has not arrived.
-fn decode_chunked(mut input: &[u8], cap: Option<usize>) -> Result<Option<Vec<u8>>, Error> {
-    let mut body = Vec::new();
-    if cap == Some(0) {
-        return Ok(Some(body));
+fn append_wire_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > MAX_RESPONSE.saturating_sub(buffer.len()) {
+        return Err(Error::TooLarge);
     }
-    loop {
-        let Some(line_end) = find(input, b"\r\n") else {
-            if input.len() > 1024 {
-                return Err(Error::TooLarge);
-            }
-            return Ok(None);
-        };
-        if line_end > 1024 {
-            return Err(Error::TooLarge);
-        }
-        let size_field = std::str::from_utf8(&input[..line_end])
-            .map_err(|_| Error::Protocol("chunk size is not UTF-8".to_string()))?;
-        let size_hex = size_field.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .map_err(|_| Error::Protocol(format!("bad chunk size: {size_field}")))?;
-        if size > MAX_RESPONSE || size.checked_add(2).is_none() {
-            return Err(Error::TooLarge);
-        }
-        input = &input[line_end + 2..];
-        if size == 0 {
-            // Trailers are not read; the terminator is enough.
-            return Ok(Some(body));
-        }
-        if let Some(cap) = cap {
-            let remaining = cap.saturating_sub(body.len());
-            if size > remaining {
-                if input.len() < remaining {
-                    return Ok(None);
-                }
-                body.extend_from_slice(&input[..remaining]);
-                return Ok(Some(body));
-            }
-            if input.len() < size {
-                return Ok(None);
-            }
-            body.extend_from_slice(&input[..size]);
-            if body.len() == cap {
-                return Ok(Some(body));
-            }
-            if input.len() < size + 2 {
-                return Ok(None);
-            }
-            input = &input[size + 2..];
-        } else {
-            if input.len() < size + 2 {
-                return Ok(None);
-            }
-            body.extend_from_slice(&input[..size]);
-            input = &input[size + 2..];
-        }
-    }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    buffer.extend_from_slice(bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -850,11 +999,9 @@ mod tests {
         .unwrap();
         assert!(matches!(result, Err(Error::Tls(_))));
         let flight = server.join().unwrap();
-        assert!(
-            flight
-                .windows(b"pinned.example".len())
-                .any(|window| window == b"pinned.example")
-        );
+        assert!(flight
+            .windows(b"pinned.example".len())
+            .any(|window| window == b"pinned.example"));
     }
 
     #[test]
@@ -888,6 +1035,207 @@ mod tests {
         assert_eq!(response.body, b"0123456789abcdef");
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn incremental_chunk_parser_is_linear_across_one_byte_feeds() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-First: a\r\nTransfer-Encoding: chunked\r\nX-Last: b\r\n\r\n3;ext=yes\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+        let mut parser = ResponseParser::new(None);
+        let mut wire = Vec::new();
+        let mut fragmented = None;
+        let mut previous_head_scan = 0;
+        let mut previous_chunk_scan = 0;
+        for byte in raw {
+            wire.push(*byte);
+            let parsed = parser.advance(&wire, false, false).unwrap();
+            assert!(parser.head_scan >= previous_head_scan);
+            assert!(parser.chunk_scan >= previous_chunk_scan);
+            previous_head_scan = parser.head_scan;
+            previous_chunk_scan = parser.chunk_scan;
+            if parsed.is_some() {
+                fragmented = parsed;
+                break;
+            }
+        }
+        let response = fragmented.expect("one-byte feed completes at zero chunk");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers,
+            vec![
+                ("X-First".into(), "a".into()),
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("X-Last".into(), "b".into())
+            ]
+        );
+        assert_eq!(response.body, b"abcde");
+        assert_eq!(parser.head_parses, 1);
+        assert_eq!(parser.payload_appended, 5);
+        assert!(parser.delimiter_candidates > 0);
+        assert!(parser.delimiter_candidates <= raw.len() * 5);
+
+        let mut coalesced = ResponseParser::new(None);
+        let expected = coalesced.advance(raw, false, false).unwrap().unwrap();
+        assert_eq!(expected.status, response.status);
+        assert_eq!(expected.headers, response.headers);
+        assert_eq!(expected.body, response.body);
+        assert_eq!(coalesced.head_parses, 1);
+        assert_eq!(coalesced.payload_appended, 5);
+        assert!(coalesced.delimiter_candidates <= raw.len() * 5);
+    }
+
+    #[test]
+    fn chunk_prefix_completes_inside_payload_or_at_its_boundary() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n";
+        let mut inside = ResponseParser::new(Some(2));
+        assert!(inside.advance(head, false, false).unwrap().is_none());
+        assert_eq!(
+            inside
+                .advance(&[head.as_slice(), b"ab"].concat(), false, false)
+                .unwrap()
+                .unwrap()
+                .body,
+            b"ab"
+        );
+
+        let mut boundary = ResponseParser::new(Some(4));
+        assert!(boundary.advance(head, false, false).unwrap().is_none());
+        assert_eq!(
+            boundary
+                .advance(&[head.as_slice(), b"abcd"].concat(), false, false)
+                .unwrap()
+                .unwrap()
+                .body,
+            b"abcd"
+        );
+
+        let valid_head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(
+            ResponseParser::new(Some(0))
+                .advance(valid_head, false, false)
+                .unwrap()
+                .unwrap()
+                .body,
+            b""
+        );
+    }
+
+    #[test]
+    fn chunk_suffix_waits_across_fragmented_payload_crlf() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut parser = ResponseParser::new(None);
+        let mut wire = head.to_vec();
+        wire.extend_from_slice(b"3\r\na\r\n");
+        assert!(parser.advance(&wire, false, false).unwrap().is_none());
+        wire.extend_from_slice(b"\r\n0\r\n");
+        assert_eq!(
+            parser.advance(&wire, false, false).unwrap().unwrap().body,
+            b"a\r\n"
+        );
+    }
+
+    #[test]
+    fn incremental_parser_preserves_eof_and_framing_errors() {
+        assert!(matches!(
+            ResponseParser::new(None).advance(b"HTTP/1.1 200 OK\r\nX: y", true, false),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            ResponseParser::new(None).advance(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc",
+                true,
+                false
+            ),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            ResponseParser::new(None).advance(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\na",
+                true,
+                false
+            ),
+            Err(Error::Protocol(_))
+        ));
+        let bodiless = ResponseParser::new(None).advance(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            false,
+            false,
+        );
+        assert!(matches!(bodiless, Err(Error::Protocol(_))));
+        assert_eq!(
+            ResponseParser::new(None)
+                .advance(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody",
+                    false,
+                    true
+                )
+                .unwrap()
+                .unwrap()
+                .body,
+            b""
+        );
+    }
+
+    #[test]
+    fn wire_limit_is_checked_before_prefix_parsing() {
+        let placeholder = b"HTTP/1.1 200 OK\r\nContent-Length: 00000000\r\n\r\n";
+        let body_len = MAX_RESPONSE - placeholder.len();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len:08}\r\n\r\n").into_bytes();
+        assert_eq!(head.len(), placeholder.len());
+        let mut exact_wire = head.clone();
+        exact_wire.resize(MAX_RESPONSE, b'x');
+
+        let mut exact = Vec::new();
+        let mut exact_parser = ResponseParser::new(Some(body_len));
+        while exact.len() < MAX_RESPONSE - 1 {
+            let start = exact.len();
+            let end = (start + 16 * 1024).min(MAX_RESPONSE - 1);
+            append_wire_bytes(&mut exact, &exact_wire[start..end]).unwrap();
+            assert!(exact_parser
+                .advance(&exact, false, false)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(exact.len(), MAX_RESPONSE - 1);
+        append_wire_bytes(&mut exact, &exact_wire[MAX_RESPONSE - 1..MAX_RESPONSE]).unwrap();
+        let response = exact_parser.advance(&exact, false, false).unwrap().unwrap();
+        assert_eq!(response.body.as_slice(), &exact_wire[head.len()..]);
+
+        let mut over = Vec::new();
+        let mut over_parser = ResponseParser::new(Some(body_len));
+        while over.len() < MAX_RESPONSE - 1 {
+            let start = over.len();
+            let end = (start + 16 * 1024).min(MAX_RESPONSE - 1);
+            append_wire_bytes(&mut over, &exact_wire[start..end]).unwrap();
+            assert!(over_parser.advance(&over, false, false).unwrap().is_none());
+        }
+        assert_eq!(over.len(), MAX_RESPONSE - 1);
+        let overread = [exact_wire[MAX_RESPONSE - 1], b'y'];
+        assert!(matches!(
+            append_wire_bytes(&mut over, &overread),
+            Err(Error::TooLarge)
+        ));
+    }
+    #[test]
+    fn chunk_size_line_guards_remain_bounded() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut long_line = head.to_vec();
+        long_line.extend(vec![b'a'; 1025]);
+        assert!(matches!(
+            ResponseParser::new(None).advance(&long_line, false, false),
+            Err(Error::TooLarge)
+        ));
+        let mut complete_long_line = long_line;
+        complete_long_line.extend_from_slice(b"\r\n");
+        assert!(matches!(
+            ResponseParser::new(None).advance(&complete_long_line, false, false),
+            Err(Error::TooLarge)
+        ));
+        let size_line = format!("{:x}\r\n", MAX_RESPONSE + 1);
+        let oversized = [head.as_slice(), size_line.as_bytes()].concat();
+        assert!(matches!(
+            ResponseParser::new(None).advance(&oversized, false, false),
+            Err(Error::TooLarge)
+        ));
     }
 
     #[test]
