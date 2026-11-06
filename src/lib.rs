@@ -545,13 +545,6 @@ fn parse_response(
     parse_response_with_limit(buffer, at_eof, head_request, None)
 }
 
-fn response_headers_too_large(buffer: &[u8]) -> bool {
-    match find(buffer, b"\r\n\r\n") {
-        Some(head_end) => head_end + 4 > MAX_RESPONSE,
-        None => buffer.len() > MAX_RESPONSE,
-    }
-}
-
 fn parse_response_with_limit(
     buffer: &[u8],
     at_eof: bool,
