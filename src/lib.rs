@@ -161,7 +161,7 @@ impl Target {
 }
 
 /// One request. Build with [`Request::get`] or [`Request::post`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Request<'a> {
     method: &'a str,
     path: &'a str,
@@ -247,11 +247,23 @@ impl<'a> Request<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Request<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Response").field("status", &self.status).finish_non_exhaustive()
+    }
 }
 
 impl Response {
@@ -428,6 +440,34 @@ pub struct Connection {
 impl Connection {
     /// Send one request, read one response, and consume the connection.
     pub async fn send(self, request: Request<'_>) -> Result<Response, Error> {
+        let token = |s: &str| {
+            !s.is_empty()
+                && s.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+                })
+        };
+        let value = |s: &str| {
+            s.bytes()
+                .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+        };
+        if !token(request.method)
+            || !request.path.starts_with('/')
+            || request.path.contains(['#', '\\'])
+            || !request.path.bytes().all(|b| (0x21..=0x7e).contains(&b))
+            || !value(&self.host_header)
+            || request.headers.iter().any(|(name, val)| {
+                !token(name)
+                    || !value(val)
+                    || ["host", "connection", "content-length", "transfer-encoding"]
+                        .iter()
+                        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            })
+            || request
+                .body
+                .is_some_and(|(content_type, _)| !value(content_type))
+        {
+            return Err(Error::Protocol("invalid request head".into()));
+        }
         let bytes = request.encode(&self.host_header);
         let head = request.method.eq_ignore_ascii_case("HEAD");
         match self.stream {
@@ -484,10 +524,7 @@ async fn exchange<S: Stream>(
             });
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if max_body.is_none() && buffer.len() > MAX_RESPONSE {
-            return Err(Error::TooLarge);
-        }
-        if max_body.is_some() && response_headers_too_large(&buffer) {
+        if buffer.len() > MAX_RESPONSE {
             return Err(Error::TooLarge);
         }
     }
@@ -506,13 +543,6 @@ fn parse_response(
     head_request: bool,
 ) -> Result<Option<Response>, Error> {
     parse_response_with_limit(buffer, at_eof, head_request, None)
-}
-
-fn response_headers_too_large(buffer: &[u8]) -> bool {
-    match find(buffer, b"\r\n\r\n") {
-        Some(head_end) => head_end + 4 > MAX_RESPONSE,
-        None => buffer.len() > MAX_RESPONSE,
-    }
 }
 
 fn parse_response_with_limit(
@@ -547,13 +577,19 @@ fn parse_response_with_limit(
         };
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() || chunked {
+                return Err(protocol("ambiguous response framing"));
+            }
             content_length = Some(
                 value
                     .parse::<usize>()
-                    .map_err(|_| Error::Protocol(format!("bad Content-Length: {value}")))?,
+                    .map_err(|_| protocol("invalid Content-Length"))?,
             );
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = value.to_ascii_lowercase().contains("chunked");
+            if chunked || content_length.is_some() || !value.eq_ignore_ascii_case("chunked") {
+                return Err(protocol("unsupported response framing"));
+            }
+            chunked = true;
         }
         headers.push((name.to_string(), value.to_string()));
     }
@@ -618,13 +654,22 @@ fn decode_chunked(mut input: &[u8], cap: Option<usize>) -> Result<Option<Vec<u8>
     }
     loop {
         let Some(line_end) = find(input, b"\r\n") else {
+            if input.len() > 1024 {
+                return Err(Error::TooLarge);
+            }
             return Ok(None);
         };
+        if line_end > 1024 {
+            return Err(Error::TooLarge);
+        }
         let size_field = std::str::from_utf8(&input[..line_end])
             .map_err(|_| Error::Protocol("chunk size is not UTF-8".to_string()))?;
         let size_hex = size_field.split(';').next().unwrap_or_default().trim();
         let size = usize::from_str_radix(size_hex, 16)
             .map_err(|_| Error::Protocol(format!("bad chunk size: {size_field}")))?;
+        if size > MAX_RESPONSE || size.checked_add(2).is_none() {
+            return Err(Error::TooLarge);
+        }
         input = &input[line_end + 2..];
         if size == 0 {
             // Trailers are not read; the terminator is enough.

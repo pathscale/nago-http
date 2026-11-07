@@ -27,9 +27,9 @@ use nagoya::reactor::Reactor;
 
 use crate::{Error, Request, Response, Target};
 
-/// How long a request may take, connect to last byte, unless
-/// [`Client::with_timeout`] says otherwise. The APIs this is for answer in
-/// milliseconds; a request still going after this is a dead connection.
+/// Network deadline after synchronous DNS resolution, from connect to last
+/// byte, unless [`Client::with_timeout`] says otherwise. The APIs this is for
+/// answer in milliseconds; a request still going after this is a dead connection.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Requests by URL, over a reactor this client runs on its own thread.
@@ -97,7 +97,10 @@ impl Client {
         Self::start(Some(config))
     }
 
-    /// Give every request this much time, connect to last byte.
+    /// Give network I/O this much time after synchronous DNS resolution.
+    /// DNS itself may block the caller without a deadline. Resolve and validate
+    /// an allowed address outside the reactor, then use `Target::pinned` with
+    /// the lower-level `send` API when destination control is required.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -302,6 +305,9 @@ struct Url<'a> {
 
 impl<'a> Url<'a> {
     fn parse(url: &'a str) -> Result<Self, Error> {
+        if url.contains('#') || url.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+            return Err(Error::Url("invalid URL characters".into()));
+        }
         // Only the scheme and host are named in errors: the path and query can
         // carry credentials.
         let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
