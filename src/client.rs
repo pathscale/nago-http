@@ -28,6 +28,45 @@ use nagoya::reactor::Reactor;
 
 use crate::{Error, Request, Response, Target};
 
+const MAX_RESOLVED_TARGETS: usize = 256;
+
+type TargetKey = (bool, String, u16);
+
+struct CachedTarget {
+    target: Arc<Target>,
+    inserted_at_ns: u64,
+}
+
+#[derive(Default)]
+struct TargetCache {
+    entries: HashMap<TargetKey, CachedTarget>,
+}
+
+impl TargetCache {
+    fn get(&self, key: &TargetKey) -> Option<&Arc<Target>> {
+        self.entries.get(key).map(|entry| &entry.target)
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, key: TargetKey, target: Arc<Target>) {
+        self.entries.insert(key, CachedTarget { target, inserted_at_ns: 0 });
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &TargetKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn resolved_len(&self) -> usize {
+        self.entries.values().filter(|entry| !entry.target.is_pinned()).count()
+    }
+}
+
 #[cfg(test)]
 type ResolveHook = std::sync::Arc<
     dyn Fn(String, u16, bool, u64) -> std::pin::Pin<Box<dyn Future<Output = Result<Target, Error>> + Send>>
@@ -42,9 +81,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Client {
     tls_config: Option<std::sync::Arc<nago_rustls::rustls::ClientConfig>>,
     reactor: Reactor,
-    /// Targets by (TLS, host, port). Resolved targets are resolved once per
-    /// host and again after a connection failure; pinned targets stay cached.
-    targets: Mutex<HashMap<(bool, String, u16), Arc<Target>>>,
+    /// Targets by (TLS, host, port). Resolved targets are retained up to
+    /// `MAX_RESOLVED_TARGETS`, then re-resolved after capacity eviction or a
+    /// connection failure. Pinned targets stay cached.
+    targets: Mutex<TargetCache>,
     resolver: &'static nagoya::resolve::Resolver,
     #[cfg(test)]
     resolve_hook: Option<ResolveHook>,
@@ -83,7 +123,7 @@ impl Client {
         Ok(Self {
             tls_config,
             reactor,
-            targets: Mutex::new(HashMap::new()),
+            targets: Mutex::new(TargetCache::default()),
             resolver,
             #[cfg(test)]
             resolve_hook: None,
@@ -242,8 +282,8 @@ impl Client {
 }
 
 fn cache_resolved_target(
-    cache: &mut HashMap<(bool, String, u16), Arc<Target>>,
-    key: (bool, String, u16),
+    cache: &mut TargetCache,
+    key: TargetKey,
     target: Arc<Target>,
     now_ns: u64,
     deadline_ns: u64,
@@ -251,18 +291,33 @@ fn cache_resolved_target(
     if now_ns >= deadline_ns {
         return None;
     }
-    Some(cache.entry(key).or_insert_with(|| target.clone()).clone())
+    if let Some(existing) = cache.get(&key) {
+        return Some(existing.clone());
+    }
+    if !target.is_pinned() && cache.resolved_len() >= MAX_RESOLVED_TARGETS {
+        let oldest = cache
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.target.is_pinned())
+            .min_by_key(|(_, entry)| entry.inserted_at_ns)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            cache.entries.remove(&oldest);
+        }
+    }
+    cache.entries.insert(key, CachedTarget { target: target.clone(), inserted_at_ns: now_ns });
+    Some(target)
 }
 
 fn forget_target_if_current(
-    cache: &mut HashMap<(bool, String, u16), Arc<Target>>,
-    key: &(bool, String, u16),
+    cache: &mut TargetCache,
+    key: &TargetKey,
     failed: &Arc<Target>,
 ) {
     if !failed.is_pinned()
         && cache.get(key).is_some_and(|current| Arc::ptr_eq(current, failed))
     {
-        cache.remove(key);
+        cache.entries.remove(key);
     }
 }
 
@@ -511,9 +566,61 @@ mod tests {
             "replace.example", 80, false,
             vec![nagoya::reactor::Addr::V4(Ipv4Addr::UNSPECIFIED.octets(), 80)],
         ).unwrap());
-        let mut cache = HashMap::from([(key.clone(), replacement.clone())]);
+        let mut cache = TargetCache::default();
+        cache.entries.insert(key.clone(), CachedTarget { target: replacement.clone(), inserted_at_ns: 1 });
         forget_target_if_current(&mut cache, &key, &old);
         assert!(cache.get(&key).is_some_and(|current| Arc::ptr_eq(current, &replacement)));
+    }
+
+    #[test]
+    fn resolved_target_cache_is_bounded_and_preserves_pinned_targets() {
+        let mut cache = TargetCache::default();
+        let pinned_key = (false, "pinned.example".to_string(), 80);
+        let pinned = Arc::new(Target::pinned(
+            "pinned.example", 80, &[IpAddr::V4(Ipv4Addr::LOCALHOST)], false,
+        ).unwrap());
+        cache.insert(pinned_key.clone(), pinned.clone());
+
+        for index in 0..MAX_RESOLVED_TARGETS {
+            let host = format!("{index}.example");
+            let key = (false, host.clone(), 80);
+            let target = Arc::new(Target::from_addrs(
+                &host, 80, false,
+                vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
+            ).unwrap());
+            assert!(cache_resolved_target(&mut cache, key, target, index as u64 + 1, u64::MAX).is_some());
+        }
+        assert_eq!(cache.resolved_len(), MAX_RESOLVED_TARGETS);
+
+        let new_key = (false, "new.example".to_string(), 80);
+        let new_target = Arc::new(Target::from_addrs(
+            "new.example", 80, false,
+            vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
+        ).unwrap());
+        assert!(cache_resolved_target(&mut cache, new_key.clone(), new_target, 10_000, u64::MAX).is_some());
+        assert_eq!(cache.resolved_len(), MAX_RESOLVED_TARGETS);
+        assert!(cache.get(&pinned_key).is_some_and(|target| Arc::ptr_eq(target, &pinned)));
+        assert!(!cache.contains_key(&(false, "0.example".to_string(), 80)));
+        assert!(cache.contains_key(&new_key));
+    }
+
+    #[test]
+    fn concurrent_same_key_resolutions_keep_the_first_cached_arc() {
+        let key = (false, "same.example".to_string(), 80);
+        let first = Arc::new(Target::from_addrs(
+            "same.example", 80, false,
+            vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
+        ).unwrap());
+        let later = Arc::new(Target::from_addrs(
+            "same.example", 80, false,
+            vec![nagoya::reactor::Addr::V4(Ipv4Addr::UNSPECIFIED.octets(), 80)],
+        ).unwrap());
+        let mut cache = TargetCache::default();
+        let admitted = cache_resolved_target(&mut cache, key.clone(), first.clone(), 10, 100).unwrap();
+        let concurrent = cache_resolved_target(&mut cache, key.clone(), later, 11, 100).unwrap();
+        assert!(Arc::ptr_eq(&admitted, &first));
+        assert!(Arc::ptr_eq(&concurrent, &first));
+        assert_eq!(cache.resolved_len(), 1);
     }
 
     #[test]

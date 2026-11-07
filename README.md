@@ -29,8 +29,10 @@ TCP through `open`/`send` and explicitly supplied TLS configs need no process
 default.
 
 Most callers want a `Client`: requests by URL, from any executor. It runs its own
-reactor on a thread of its own, resolves each host once, and gives every request
-a deadline (30 s unless `with_timeout` says otherwise).
+reactor on a thread of its own, caches up to 256 resolved targets, and gives
+every request a deadline (30 s unless `with_timeout` says otherwise). A target
+may be resolved again after a connection failure or capacity eviction; the
+client cache does not promise a DNS TTL.
 
 ```rust
 let client = nago_http::Client::global()?;
@@ -62,8 +64,9 @@ let response = block_on_with(&reactor, nago_http::send(
 
 `open` dials only the addresses stored in its `Target`; it does not look up the
 host name. A pinned target already in a `Client` cache stays there after a
-failed connection. Resolved targets continue to be looked up again after a
-connection failure.
+failed connection and is not counted toward the resolved-target capacity.
+Resolved targets are looked up again after a connection failure or capacity
+eviction; the client cache does not promise a DNS TTL.
 
 `send` imposes no timeout; wrap it in `nagoya::timeout`.
 
