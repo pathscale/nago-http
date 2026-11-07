@@ -42,8 +42,10 @@ let response = client
 ```
 
 `https://` goes over TLS; `http://` is plain TCP, for a local stand-in such as a
-loopback S3, never for a credential crossing the network. `HEAD`, 1xx, 204 and 304
-responses have no body, whatever `Content-Length` says.
+loopback S3, never for a credential crossing the network. `HEAD` and 304 responses
+are bodiless and may carry otherwise valid framing metadata. Informational responses
+are consumed before the final response; 1xx or 204 responses with `Content-Length`
+or `Transfer-Encoding` are rejected.
 
 To drive the reactor yourself, give `Target::pinned` the addresses you already
 have, then call `send`:
