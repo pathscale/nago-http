@@ -739,6 +739,9 @@ impl ResponseParser {
                 self.headers.push((name.to_string(), value.trim().to_string()));
             }
         }
+        if (interim || status == 204) && (content_length.is_some() || chunked) {
+            return Err(protocol("forbidden response framing on 1xx or 204"));
+        }
         #[cfg(test)]
         {
             self.head_parses += 1;
@@ -1445,6 +1448,180 @@ mod tests {
             parse_response(interim, true, false),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn forbidden_bodiless_framing_is_rejected() {
+        let final_response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let cases = [
+            (100, "cOnTeNt-LeNgTh: \t0 "),
+            (100, "Content-Length: 7"),
+            (100, "Transfer-Encoding: chunked"),
+            (103, "Content-Length: 0"),
+            (103, "Content-Length: 7"),
+            (103, "Transfer-Encoding: chunked"),
+            (199, "Content-Length: 0"),
+            (199, "Content-Length: 7"),
+            (199, "Transfer-Encoding: chunked"),
+            (204, "Content-Length: 0"),
+            (204, "Content-Length: 7"),
+            (204, "Transfer-Encoding: chunked"),
+        ];
+
+        for (status, field) in cases {
+            let head = format!("HTTP/1.1 {status} Test\r\n{field}\r\n\r\n");
+            let mut raw = head.as_bytes().to_vec();
+            if status < 200 {
+                raw.extend_from_slice(final_response);
+            }
+            for head_request in [false, true] {
+                for max_body in [None, Some(0)] {
+                    let error = ResponseParser::new(max_body)
+                        .advance(&raw, false, head_request)
+                        .expect_err("forbidden framing must fail at the head");
+                    assert!(matches!(&error, Error::Protocol(detail)
+                        if detail == "forbidden response framing on 1xx or 204"));
+                    assert_eq!(
+                        error.to_string(),
+                        "malformed response: forbidden response framing on 1xx or 204"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forbidden_bodiless_framing_fails_at_head_boundary() {
+        let cases = [
+            b"HTTP/1.1 103 Early Hints\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+        ];
+        for head in cases {
+            for head_request in [false, true] {
+                let mut parser = ResponseParser::new(Some(0));
+                for end in 1..head.len() {
+                    assert!(parser
+                        .advance(&head[..end], false, head_request)
+                        .unwrap()
+                        .is_none());
+                }
+                let error = parser
+                    .advance(head, false, head_request)
+                    .expect_err("complete malformed head must fail before suffix or EOF");
+                assert!(matches!(error, Error::Protocol(ref detail)
+                    if detail == "forbidden response framing on 1xx or 204"));
+
+                let eof_error = ResponseParser::new(Some(0))
+                    .advance(head, true, head_request)
+                    .expect_err("EOF must not be needed to reject a complete malformed head");
+                assert!(matches!(eof_error, Error::Protocol(ref detail)
+                    if detail == "forbidden response framing on 1xx or 204"));
+            }
+        }
+    }
+
+    #[test]
+    fn head_and_304_framing_metadata_remains_bodiless() {
+        let cases = [
+            ("HEAD", 200, "Content-Length: 0", "0"),
+            ("HEAD", 200, "Content-Length: 7", "7"),
+            ("HEAD", 200, "Transfer-Encoding: chunked", "chunked"),
+            ("GET", 304, "Content-Length: 0", "0"),
+            ("GET", 304, "Content-Length: 7", "7"),
+            ("GET", 304, "Transfer-Encoding: chunked", "chunked"),
+        ];
+        for (method, status, field, value) in cases {
+            let raw = format!("HTTP/1.1 {status} Test\r\n{field}\r\nX-Keep: yes\r\n\r\n");
+            let head_request = method == "HEAD";
+            for max_body in [None, Some(0)] {
+                let mut parser = ResponseParser::new(max_body);
+                for end in 1..raw.len() {
+                    assert!(parser.advance(&raw.as_bytes()[..end], false, head_request)
+                        .unwrap().is_none());
+                }
+                let response = parser
+                    .advance(raw.as_bytes(), false, head_request)
+                    .unwrap()
+                    .expect("bodiless response completes at its head");
+                assert_eq!(response.status, status);
+                assert_eq!(response.body, b"");
+                assert_eq!(response.header("x-keep"), Some("yes"));
+                let framing_header = if field.starts_with("Content-Length") {
+                    "Content-Length"
+                } else {
+                    "Transfer-Encoding"
+                };
+                let expected_headers = vec![
+                    (framing_header.to_string(), value.to_string()),
+                    ("X-Keep".to_string(), "yes".to_string()),
+                ];
+                assert_eq!(response.headers, expected_headers);
+
+                let coalesced = parse_response_with_limit(
+                    raw.as_bytes(),
+                    false,
+                    head_request,
+                    max_body,
+                )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(coalesced.status, status);
+                assert_eq!(coalesced.body, b"");
+                assert_eq!(coalesced.headers, expected_headers);
+            }
+        }
+    }
+
+    #[test]
+    fn head_semantics_apply_after_valid_informational_heads() {
+        let interim = b"HTTP/1.1 100 Continue\r\nX-Interim: first\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n";
+        let final_head = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nX-Final: yes\r\n\r\n";
+        let raw = [interim.as_slice(), final_head.as_slice()].concat();
+        let mut parser = ResponseParser::new(None);
+        for end in 1..raw.len() {
+            assert!(parser.advance(&raw[..end], false, true).unwrap().is_none());
+        }
+        let response = parser
+            .advance(&raw, false, true)
+            .unwrap()
+            .expect("HEAD final response completes at its header boundary");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"");
+        assert_eq!(response.headers, vec![
+            ("Content-Length".to_string(), "7".to_string()),
+            ("X-Final".to_string(), "yes".to_string()),
+        ]);
+        assert_eq!(response.header("x-interim"), None);
+        assert_eq!(response.header("link"), None);
+    }
+
+    #[test]
+    fn header_only_204_remains_valid_and_existing_framing_errors_keep_precedence() {
+        let response = parse_response(b"HTTP/1.1 204 No Content\r\n\r\n", false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 204);
+        assert_eq!(response.body, b"");
+
+        let upgrade = parse_response(b"HTTP/1.1 101 Switching Protocols\r\n\r\n", false, false)
+            .unwrap_err();
+        assert!(matches!(upgrade, Error::Protocol(ref detail)
+            if detail == "switching protocols is unsupported"));
+        let legacy_te = parse_response(
+            b"HTTP/1.0 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n",
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(legacy_te, Error::Protocol(ref detail)
+            if detail == "Transfer-Encoding on HTTP/1.0 response"));
+        for raw in [
+            &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"[..],
+            &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            &b"HTTP/1.1 304 Not Modified\r\nContent-Length: nope\r\n\r\n"[..],
+        ] {
+            assert!(matches!(parse_response(raw, false, true), Err(Error::Protocol(_))));
+        }
     }
 
     #[test]
