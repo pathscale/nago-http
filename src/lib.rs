@@ -801,15 +801,21 @@ impl ResponseParser {
                     let body = std::mem::take(&mut self.body);
                     return Ok(Some(self.response(body)));
                 }
-                let line = std::str::from_utf8(&buffer[line_start..line_end])
-                    .map_err(|_| protocol("chunk trailer is not UTF-8"))?;
-                let Some((name, value)) = line.split_once(':') else {
+                let line = &buffer[line_start..line_end];
+                let Some(colon) = line.iter().position(|byte| *byte == b':') else {
                     return Err(protocol("malformed chunk trailer"));
                 };
-                if !is_http_token(name)
-                    || !value.bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+                let name = &line[..colon];
+                let value = &line[colon + 1..];
+                if !name.is_ascii()
+                    || !is_http_token(std::str::from_utf8(name).expect("ASCII field name"))
+                    || !value.iter().all(|byte| {
+                        *byte == b'\t' || *byte >= 0x20 && *byte != 0x7f
+                    })
                     || ["content-length", "transfer-encoding", "host"]
-                        .iter().any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+                        .iter().any(|forbidden| {
+                            name.eq_ignore_ascii_case(forbidden.as_bytes())
+                        })
                 {
                     return Err(protocol("malformed or forbidden chunk trailer"));
                 }
@@ -1353,6 +1359,45 @@ mod tests {
         let response = parse_response(&valid, false, false).unwrap().unwrap();
         assert_eq!(response.body, b"x");
         assert_eq!(response.header("x-end"), None);
+    }
+
+    #[test]
+    fn synthetic_chunked_response_accepts_obs_text_trailer_value() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let valid = [
+            head.as_slice(),
+            b"1\r\nx\r\n0\r\nX-Note: ",
+            &[0xe9][..],
+            b"\r\n\r\n",
+        ]
+        .concat();
+        let response = parse_response(&valid, false, false).unwrap().unwrap();
+        assert_eq!(response.body, b"x");
+        assert_eq!(response.header("x-note"), None);
+
+        let non_ascii_name = [
+            head.as_slice(),
+            b"0\r\nX-",
+            &[0xe9][..],
+            b": value\r\n\r\n",
+        ]
+        .concat();
+        assert!(matches!(
+            parse_response(&non_ascii_name, false, false),
+            Err(Error::Protocol(_))
+        ));
+
+        for forbidden in [
+            &b"Content-Length: 0"[..],
+            &b"Transfer-Encoding: chunked"[..],
+            &b"Host: example.test"[..],
+        ] {
+            let raw = [head.as_slice(), b"0\r\n", forbidden, b"\r\n\r\n"].concat();
+            assert!(matches!(
+                parse_response(&raw, false, false),
+                Err(Error::Protocol(_))
+            ));
+        }
     }
 
     #[test]
