@@ -8,9 +8,9 @@
 //! progress because that thread polls it, not because the caller's executor
 //! does.
 //!
-//! It also resolves each host once and keeps the answer, and puts a deadline
-//! on every request, which is what each backend was otherwise writing for
-//! itself around [`send`](crate::send).
+//! It also caches up to 256 resolved targets, re-resolving after capacity
+//! eviction or connection failure, and puts a deadline on every request.
+//! The cache makes no DNS TTL promise.
 //!
 //! ```no_run
 //! let client = nago_http::Client::global()?;
