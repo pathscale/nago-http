@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use nago_http::Client;
+use nago_http::{send, Request, Target};
 
 #[test]
 fn put_writes_a_large_body_to_a_slow_reader() {
@@ -13,9 +13,10 @@ fn put_writes_a_large_body_to_a_slow_reader() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
     let address = listener.local_addr().expect("listener address");
     let _ = ps_rustcrypto::provider().install_default();
-    let client = Client::new()
-        .expect("client")
-        .with_timeout(Duration::from_secs(10));
+    let target = Target::pinned("127.0.0.1", address.port(), &[address.ip()], false)
+        .expect("pinned loopback target");
+    let reactor = nagoya::reactor::Reactor::local().expect("local reactor");
+    let handle = reactor.handle();
 
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept client");
@@ -70,10 +71,19 @@ fn put_writes_a_large_body_to_a_slow_reader() {
     });
 
     let body = vec![0xA5; BODY_SIZE];
-    let url = format!("http://{address}/snapshot");
-    let response =
-        nagoya::block_on(client.send("PUT", &url, &[], Some(("application/octet-stream", &body))))
-            .expect("large PUT");
+    let response = nagoya::reactor::block_on_with(
+        &reactor,
+        nagoya::timeout(
+            Duration::from_secs(10),
+            send(
+                &target,
+                &handle,
+                Request::new("PUT", "/snapshot").body("application/octet-stream", &body),
+            ),
+        ),
+    )
+    .expect("large PUT timed out")
+    .expect("large PUT");
 
     assert_eq!(response.status, 200);
     assert_eq!(server.join().expect("server thread"), BODY_SIZE);
