@@ -278,6 +278,45 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    #[test]
+    fn malformed_ports_do_not_echo_input() {
+        for (authority, port) in [
+            ("example.test", "PORT_MARKER"),
+            ("example.test", ""),
+            ("example.test", "65536"),
+            ("[2001:db8::1]", "PORT_MARKER"),
+            ("[2001:db8::1]", ""),
+            ("[2001:db8::1]", "65536"),
+        ] {
+            let input = format!("https://{authority}:{port}/PATH_MARKER?QUERY_MARKER");
+            let error = Url::parse(&input).expect_err("port must be rejected");
+            assert!(matches!(&error, Error::Url(detail) if detail == "bad port"));
+
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            for marker in ["PORT_MARKER", "PATH_MARKER", "QUERY_MARKER"] {
+                assert!(!display.contains(marker), "display leaked {marker}");
+                assert!(!debug.contains(marker), "debug leaked {marker}");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_ports_preserve_url_parts() {
+        for (input, expected_tls, expected_host, expected_port) in [
+            ("http://example.test/path?query", false, "example.test", 80),
+            ("https://example.test/path?query", true, "example.test", 443),
+            ("http://example.test:8080/path?query", false, "example.test", 8080),
+            ("https://[2001:db8::1]:8443/path?query", true, "2001:db8::1", 8443),
+        ] {
+            let parsed = Url::parse(input).expect("valid URL");
+            assert_eq!(parsed.tls, expected_tls);
+            assert_eq!(parsed.host, expected_host);
+            assert_eq!(parsed.port, expected_port);
+            assert_eq!(parsed.path_and_query, "/path?query");
+        }
+    }
+
     fn read_request(stream: &mut std::net::TcpStream) {
         let mut request = Vec::new();
         let mut chunk = [0; 1024];
@@ -566,5 +605,5 @@ impl<'a> Url<'a> {
 
 fn parse_port(port: &str) -> Result<u16, Error> {
     port.parse()
-        .map_err(|_| Error::Url(format!("bad port {port}")))
+        .map_err(|_| Error::Url("bad port".into()))
 }
