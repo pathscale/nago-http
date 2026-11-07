@@ -621,11 +621,11 @@ impl ResponseParser {
     ) -> Result<Option<Response>, Error> {
         let protocol = |detail: &str| Error::Protocol(detail.to_string());
         while self.framing.is_none() {
-            let (head_end, scanned) =
+            let (head_end, _scanned) =
                 find_from(buffer, b"\r\n\r\n", &mut self.head_scan, 3, self.head_start);
             #[cfg(test)]
             {
-                self.delimiter_candidates += scanned;
+                self.delimiter_candidates += _scanned;
             }
             if let Some(end) = head_end {
                 self.parse_head(buffer, end, head_request)?;
@@ -789,9 +789,9 @@ impl ResponseParser {
             }
             if self.trailers_pending {
                 let line_start = self.chunk_cursor;
-                let (line_end, scanned) = find_from(buffer, b"\r\n", &mut self.chunk_scan, 1, line_start);
+                let (line_end, _scanned) = find_from(buffer, b"\r\n", &mut self.chunk_scan, 1, line_start);
                 #[cfg(test)]
-                { self.delimiter_candidates += scanned; }
+                { self.delimiter_candidates += _scanned; }
                 check_chunk_line_limit(buffer, line_start, line_end)?;
                 let Some(line_end) = line_end else {
                     if at_eof { return Err(protocol("connection closed before chunk trailers ended")); }
@@ -852,11 +852,11 @@ impl ResponseParser {
                 continue;
             }
             let line_start = self.chunk_cursor;
-            let (line_end, scanned) =
+            let (line_end, _scanned) =
                 find_from(buffer, b"\r\n", &mut self.chunk_scan, 1, line_start);
             #[cfg(test)]
             {
-                self.delimiter_candidates += scanned;
+                self.delimiter_candidates += _scanned;
             }
             check_chunk_line_limit(buffer, line_start, line_end)?;
             let Some(line_end) = line_end else {
