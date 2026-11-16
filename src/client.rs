@@ -49,7 +49,13 @@ impl TargetCache {
 
     #[cfg(test)]
     fn insert(&mut self, key: TargetKey, target: Arc<Target>) {
-        self.entries.insert(key, CachedTarget { target, inserted_at_ns: 0 });
+        self.entries.insert(
+            key,
+            CachedTarget {
+                target,
+                inserted_at_ns: 0,
+            },
+        );
     }
 
     #[cfg(test)]
@@ -63,13 +69,21 @@ impl TargetCache {
     }
 
     fn resolved_len(&self) -> usize {
-        self.entries.values().filter(|entry| !entry.target.is_pinned()).count()
+        self.entries
+            .values()
+            .filter(|entry| !entry.target.is_pinned())
+            .count()
     }
 }
 
 #[cfg(test)]
 type ResolveHook = std::sync::Arc<
-    dyn Fn(String, u16, bool, u64) -> std::pin::Pin<Box<dyn Future<Output = Result<Target, Error>> + Send>>
+    dyn Fn(
+            String,
+            u16,
+            bool,
+            u64,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Target, Error>> + Send>>
         + Send
         + Sync,
 >;
@@ -177,9 +191,8 @@ impl Client {
         headers: &[(&str, &str)],
         body: Option<(&str, &[u8])>,
     ) -> Result<Response, Error> {
-        let deadline_ns = nagoya::time::now_ns().saturating_add(
-            u64::try_from(self.timeout.as_nanos()).unwrap_or(u64::MAX),
-        );
+        let deadline_ns = nagoya::time::now_ns()
+            .saturating_add(u64::try_from(self.timeout.as_nanos()).unwrap_or(u64::MAX));
         let url = Url::parse(url)?;
         if nagoya::time::now_ns() >= deadline_ns {
             return Err(timeout_error(&url, self.timeout));
@@ -257,7 +270,13 @@ impl Client {
 
     async fn target(&self, url: &Url<'_>, deadline_ns: u64) -> Result<Arc<Target>, Error> {
         let key = (url.tls, url.host.to_string(), url.port);
-        let cached = { self.targets.lock().expect("not poisoned").get(&key).cloned() };
+        let cached = {
+            self.targets
+                .lock()
+                .expect("not poisoned")
+                .get(&key)
+                .cloned()
+        };
         if let Some(target) = cached {
             if nagoya::time::now_ns() < deadline_ns {
                 return Ok(target);
@@ -307,24 +326,32 @@ fn cache_resolved_target(
             cache.entries.remove(&oldest);
         }
     }
-    cache.entries.insert(key, CachedTarget { target: target.clone(), inserted_at_ns: now_ns });
+    cache.entries.insert(
+        key,
+        CachedTarget {
+            target: target.clone(),
+            inserted_at_ns: now_ns,
+        },
+    );
     Some(target)
 }
 
-fn forget_target_if_current(
-    cache: &mut TargetCache,
-    key: &TargetKey,
-    failed: &Arc<Target>,
-) {
+fn forget_target_if_current(cache: &mut TargetCache, key: &TargetKey, failed: &Arc<Target>) {
     if !failed.is_pinned()
-        && cache.get(key).is_some_and(|current| Arc::ptr_eq(current, failed))
+        && cache
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, failed))
     {
         cache.entries.remove(key);
     }
 }
 
 fn timeout_error(url: &Url<'_>, timeout: Duration) -> Error {
-    Error::Timeout(format!("{} did not answer within {}s", url.host, timeout.as_secs()))
+    Error::Timeout(format!(
+        "{} did not answer within {}s",
+        url.host,
+        timeout.as_secs()
+    ))
 }
 
 #[cfg(test)]
@@ -363,8 +390,18 @@ mod tests {
         for (input, expected_tls, expected_host, expected_port) in [
             ("http://example.test/path?query", false, "example.test", 80),
             ("https://example.test/path?query", true, "example.test", 443),
-            ("http://example.test:8080/path?query", false, "example.test", 8080),
-            ("https://[2001:db8::1]:8443/path?query", true, "2001:db8::1", 8443),
+            (
+                "http://example.test:8080/path?query",
+                false,
+                "example.test",
+                8080,
+            ),
+            (
+                "https://[2001:db8::1]:8443/path?query",
+                true,
+                "2001:db8::1",
+                8443,
+            ),
         ] {
             let parsed = Url::parse(input).expect("valid URL");
             assert_eq!(parsed.tls, expected_tls);
@@ -405,7 +442,11 @@ mod tests {
             false,
         )
         .unwrap();
-        client.targets.lock().unwrap().insert(key.clone(), Arc::new(target));
+        client
+            .targets
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::new(target));
         let url = format!("http://example.com:{port}/");
 
         let first = nagoya::block_on(nagoya::timeout(
@@ -458,10 +499,17 @@ mod tests {
             "127.0.0.1",
             port,
             false,
-            vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), port)],
+            vec![nagoya::reactor::Addr::V4(
+                Ipv4Addr::LOCALHOST.octets(),
+                port,
+            )],
         )
         .unwrap();
-        client.targets.lock().unwrap().insert(key.clone(), Arc::new(target));
+        client
+            .targets
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::new(target));
         let url = format!("http://127.0.0.1:{port}/");
         let result = nagoya::block_on(nagoya::timeout(
             Duration::from_secs(2),
@@ -489,8 +537,9 @@ mod tests {
                 match attempt.await {
                     Ok(target) => return Ok(target),
                     Err(Error::Resolve(message)) if message == "bounded DNS admission is busy" => {
-                        let retry_at =
-                            nagoya::time::now_ns().saturating_add(1_000_000).min(deadline);
+                        let retry_at = nagoya::time::now_ns()
+                            .saturating_add(1_000_000)
+                            .min(deadline);
                         nagoya::sleep_until(retry_at).await;
                     }
                     Err(error) => return Err(error),
@@ -515,36 +564,52 @@ mod tests {
         });
 
         let _ = ps_rustcrypto::provider().install_default();
-        let mut client = Client::new().unwrap().with_timeout(Duration::from_millis(800));
+        let mut client = Client::new()
+            .unwrap()
+            .with_timeout(Duration::from_millis(800));
         let dns_ready_ns = nagoya::time::now_ns().saturating_add(500_000_000);
-        client.resolve_hook = Some(std::sync::Arc::new(move |host, target_port, tls, deadline| {
-            Box::pin(async move {
-                nagoya::sleep_until(dns_ready_ns).await;
-                assert!(nagoya::time::now_ns() < deadline);
-                Target::from_addrs(
-                    &host,
-                    target_port,
-                    tls,
-                    vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), target_port)],
-                )
-            })
-        }));
+        client.resolve_hook = Some(std::sync::Arc::new(
+            move |host, target_port, tls, deadline| {
+                Box::pin(async move {
+                    nagoya::sleep_until(dns_ready_ns).await;
+                    assert!(nagoya::time::now_ns() < deadline);
+                    Target::from_addrs(
+                        &host,
+                        target_port,
+                        tls,
+                        vec![nagoya::reactor::Addr::V4(
+                            Ipv4Addr::LOCALHOST.octets(),
+                            target_port,
+                        )],
+                    )
+                })
+            },
+        ));
         let started = std::time::Instant::now();
         let result = nagoya::block_on(client.get(&format!("http://delayed.test:{port}/"), &[]));
         assert!(matches!(result, Err(Error::Timeout(_))));
-        assert!(started.elapsed() < Duration::from_millis(1_200), "deadline was reset after DNS");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_200),
+            "deadline was reset after DNS"
+        );
         accepted_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("delayed DNS completed and request reached stalled transport");
         release_tx.send(()).unwrap();
         server.join().unwrap();
-        assert!(!client.targets.lock().unwrap().contains_key(&(false, "delayed.test".into(), port)));
+        assert!(!client.targets.lock().unwrap().contains_key(&(
+            false,
+            "delayed.test".into(),
+            port
+        )));
     }
 
     #[test]
     fn expired_resolver_answer_cannot_populate_client_cache() {
         let _ = ps_rustcrypto::provider().install_default();
-        let mut client = Client::new().unwrap().with_timeout(Duration::from_millis(100));
+        let mut client = Client::new()
+            .unwrap()
+            .with_timeout(Duration::from_millis(100));
         client.resolve_hook = Some(std::sync::Arc::new(|host, port, tls, deadline| {
             Box::pin(async move {
                 nagoya::sleep_until(deadline.saturating_add(50_000_000)).await;
@@ -552,60 +617,118 @@ mod tests {
                     &host,
                     port,
                     tls,
-                    vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), port)],
+                    vec![nagoya::reactor::Addr::V4(
+                        Ipv4Addr::LOCALHOST.octets(),
+                        port,
+                    )],
                 )
             })
         }));
         let result = nagoya::block_on(client.get("http://late.example/", &[]));
         assert!(matches!(result, Err(Error::Timeout(_))));
-        assert!(!client.targets.lock().unwrap().contains_key(&(false, "late.example".into(), 80)));
+        assert!(
+            !client
+                .targets
+                .lock()
+                .unwrap()
+                .contains_key(&(false, "late.example".into(), 80))
+        );
     }
 
     #[test]
     fn stale_transport_failure_cannot_remove_replacement_target() {
         let key = (false, "replace.example".to_string(), 80);
-        let old = Arc::new(Target::from_addrs(
-            "replace.example", 80, false,
-            vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
-        ).unwrap());
-        let replacement = Arc::new(Target::from_addrs(
-            "replace.example", 80, false,
-            vec![nagoya::reactor::Addr::V4(Ipv4Addr::UNSPECIFIED.octets(), 80)],
-        ).unwrap());
+        let old = Arc::new(
+            Target::from_addrs(
+                "replace.example",
+                80,
+                false,
+                vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
+            )
+            .unwrap(),
+        );
+        let replacement = Arc::new(
+            Target::from_addrs(
+                "replace.example",
+                80,
+                false,
+                vec![nagoya::reactor::Addr::V4(
+                    Ipv4Addr::UNSPECIFIED.octets(),
+                    80,
+                )],
+            )
+            .unwrap(),
+        );
         let mut cache = TargetCache::default();
-        cache.entries.insert(key.clone(), CachedTarget { target: replacement.clone(), inserted_at_ns: 1 });
+        cache.entries.insert(
+            key.clone(),
+            CachedTarget {
+                target: replacement.clone(),
+                inserted_at_ns: 1,
+            },
+        );
         forget_target_if_current(&mut cache, &key, &old);
-        assert!(cache.get(&key).is_some_and(|current| Arc::ptr_eq(current, &replacement)));
+        assert!(
+            cache
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &replacement))
+        );
     }
 
     #[test]
     fn resolved_target_cache_is_bounded_and_preserves_pinned_targets() {
         let mut cache = TargetCache::default();
         let pinned_key = (false, "pinned.example".to_string(), 80);
-        let pinned = Arc::new(Target::pinned(
-            "pinned.example", 80, &[IpAddr::V4(Ipv4Addr::LOCALHOST)], false,
-        ).unwrap());
+        let pinned = Arc::new(
+            Target::pinned(
+                "pinned.example",
+                80,
+                &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                false,
+            )
+            .unwrap(),
+        );
         cache.insert(pinned_key.clone(), pinned.clone());
 
         for index in 0..MAX_RESOLVED_TARGETS {
             let host = format!("{index}.example");
             let key = (false, host.clone(), 80);
-            let target = Arc::new(Target::from_addrs(
-                &host, 80, false,
-                vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
-            ).unwrap());
-            assert!(cache_resolved_target(&mut cache, key, target, index as u64 + 1, u64::MAX).is_some());
+            let target = Arc::new(
+                Target::from_addrs(
+                    &host,
+                    80,
+                    false,
+                    vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
+                )
+                .unwrap(),
+            );
+            assert!(
+                cache_resolved_target(&mut cache, key, target, index as u64 + 1, u64::MAX)
+                    .is_some()
+            );
         }
         assert_eq!(cache.resolved_len(), MAX_RESOLVED_TARGETS);
 
         let new_key = (false, "new.example".to_string(), 80);
-        let new_target = Arc::new(Target::from_addrs(
-            "new.example", 80, false,
-            vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
-        ).unwrap());
-        assert!(cache_resolved_target(&mut cache, new_key.clone(), new_target, 10_000, u64::MAX).is_some());
+        let new_target = Arc::new(
+            Target::from_addrs(
+                "new.example",
+                80,
+                false,
+                vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
+            )
+            .unwrap(),
+        );
+        assert!(
+            cache_resolved_target(&mut cache, new_key.clone(), new_target, 10_000, u64::MAX)
+                .is_some()
+        );
         assert_eq!(cache.resolved_len(), MAX_RESOLVED_TARGETS);
-        assert!(cache.get(&pinned_key).is_some_and(|target| Arc::ptr_eq(target, &pinned)));
+        assert!(
+            cache
+                .get(&pinned_key)
+                .is_some_and(|target| Arc::ptr_eq(target, &pinned))
+        );
         assert!(!cache.contains_key(&(false, "0.example".to_string(), 80)));
         assert!(cache.contains_key(&new_key));
     }
@@ -613,16 +736,30 @@ mod tests {
     #[test]
     fn concurrent_same_key_resolutions_keep_the_first_cached_arc() {
         let key = (false, "same.example".to_string(), 80);
-        let first = Arc::new(Target::from_addrs(
-            "same.example", 80, false,
-            vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
-        ).unwrap());
-        let later = Arc::new(Target::from_addrs(
-            "same.example", 80, false,
-            vec![nagoya::reactor::Addr::V4(Ipv4Addr::UNSPECIFIED.octets(), 80)],
-        ).unwrap());
+        let first = Arc::new(
+            Target::from_addrs(
+                "same.example",
+                80,
+                false,
+                vec![nagoya::reactor::Addr::V4(Ipv4Addr::LOCALHOST.octets(), 80)],
+            )
+            .unwrap(),
+        );
+        let later = Arc::new(
+            Target::from_addrs(
+                "same.example",
+                80,
+                false,
+                vec![nagoya::reactor::Addr::V4(
+                    Ipv4Addr::UNSPECIFIED.octets(),
+                    80,
+                )],
+            )
+            .unwrap(),
+        );
         let mut cache = TargetCache::default();
-        let admitted = cache_resolved_target(&mut cache, key.clone(), first.clone(), 10, 100).unwrap();
+        let admitted =
+            cache_resolved_target(&mut cache, key.clone(), first.clone(), 10, 100).unwrap();
         let concurrent = cache_resolved_target(&mut cache, key.clone(), later, 11, 100).unwrap();
         assert!(Arc::ptr_eq(&admitted, &first));
         assert!(Arc::ptr_eq(&concurrent, &first));
@@ -717,6 +854,5 @@ impl<'a> Url<'a> {
 }
 
 fn parse_port(port: &str) -> Result<u16, Error> {
-    port.parse()
-        .map_err(|_| Error::Url("bad port".into()))
+    port.parse().map_err(|_| Error::Url("bad port".into()))
 }
