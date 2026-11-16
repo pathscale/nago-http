@@ -42,11 +42,11 @@
 
 use core::fmt;
 
+use nago_rustls::TlsSession;
 use nago_rustls::rustls::ClientConnection;
 use nago_rustls::rustls_pki_types::ServerName;
-use nago_rustls::TlsSession;
 use nagoya::io::Stream;
-use nagoya::reactor::{connect_any, resolve, Addr, Handle, TcpStream};
+use nagoya::reactor::{Addr, Handle, TcpStream, connect_any, resolve};
 
 mod client;
 pub use client::{Client, DEFAULT_TIMEOUT};
@@ -654,12 +654,12 @@ impl ResponseParser {
             }
             BodyFraming::CloseDelimited => {
                 let available = buffer.len().saturating_sub(self.body_start);
-                if let Some(cap) = self.cap {
-                    if available >= cap {
-                        return Ok(Some(self.response(
-                            buffer[self.body_start..self.body_start + cap].to_vec(),
-                        )));
-                    }
+                if let Some(cap) = self.cap
+                    && available >= cap
+                {
+                    return Ok(Some(self.response(
+                        buffer[self.body_start..self.body_start + cap].to_vec(),
+                    )));
                 }
                 if at_eof {
                     Ok(Some(self.response(buffer[self.body_start..].to_vec())))
@@ -718,7 +718,9 @@ impl ResponseParser {
                 if content_length.is_some() || chunked {
                     return Err(protocol("ambiguous response framing"));
                 }
-                if framing_value.is_empty() || !framing_value.bytes().all(|byte| byte.is_ascii_digit()) {
+                if framing_value.is_empty()
+                    || !framing_value.bytes().all(|byte| byte.is_ascii_digit())
+                {
                     return Err(protocol("invalid Content-Length"));
                 }
                 content_length = Some(
@@ -730,7 +732,10 @@ impl ResponseParser {
                 if version == "HTTP/1.0" {
                     return Err(protocol("Transfer-Encoding on HTTP/1.0 response"));
                 }
-                if chunked || content_length.is_some() || !framing_value.eq_ignore_ascii_case("chunked") {
+                if chunked
+                    || content_length.is_some()
+                    || !framing_value.eq_ignore_ascii_case("chunked")
+                {
                     return Err(protocol("unsupported response framing"));
                 }
                 chunked = true;
@@ -792,12 +797,17 @@ impl ResponseParser {
             }
             if self.trailers_pending {
                 let line_start = self.chunk_cursor;
-                let (line_end, _scanned) = find_from(buffer, b"\r\n", &mut self.chunk_scan, 1, line_start);
+                let (line_end, _scanned) =
+                    find_from(buffer, b"\r\n", &mut self.chunk_scan, 1, line_start);
                 #[cfg(test)]
-                { self.delimiter_candidates += _scanned; }
+                {
+                    self.delimiter_candidates += _scanned;
+                }
                 check_chunk_line_limit(buffer, line_start, line_end)?;
                 let Some(line_end) = line_end else {
-                    if at_eof { return Err(protocol("connection closed before chunk trailers ended")); }
+                    if at_eof {
+                        return Err(protocol("connection closed before chunk trailers ended"));
+                    }
                     return Ok(None);
                 };
                 if line_end == line_start {

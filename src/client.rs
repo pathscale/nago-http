@@ -20,7 +20,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -197,7 +197,8 @@ impl Client {
         }
         let handle = self.reactor.handle();
         let exchange = async {
-            let connection = crate::open_with_tls_config(&target, &handle, self.tls_config.clone()).await?;
+            let connection =
+                crate::open_with_tls_config(&target, &handle, self.tls_config.clone()).await?;
             connection.send(request).await
         };
         let mut exchange = Box::pin(exchange);
@@ -270,7 +271,8 @@ impl Client {
             Target::resolve_until(self.resolver, url.host, url.port, url.tls, deadline_ns).await?
         };
         #[cfg(not(test))]
-        let resolved = Target::resolve_until(self.resolver, url.host, url.port, url.tls, deadline_ns).await?;
+        let resolved =
+            Target::resolve_until(self.resolver, url.host, url.port, url.tls, deadline_ns).await?;
         let target = Arc::new(resolved);
         if nagoya::time::now_ns() >= deadline_ns {
             return Err(timeout_error(url, self.timeout));
@@ -443,7 +445,6 @@ mod tests {
         server.join().unwrap();
     }
 
-
     #[test]
     fn client_forgets_a_seeded_unpinned_target_after_refused_connect() {
         let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -479,12 +480,17 @@ mod tests {
         let target = nagoya::block_on(async {
             loop {
                 if nagoya::time::now_ns() >= deadline {
-                    return Err(Error::Timeout("localhost resolver admission exceeded the fixture deadline".into()));
+                    return Err(Error::Timeout(
+                        "localhost resolver admission exceeded the fixture deadline".into(),
+                    ));
                 }
-                match Target::resolve_until(client.resolver, "localhost", 80, false, deadline).await {
+                let attempt =
+                    Target::resolve_until(client.resolver, "localhost", 80, false, deadline);
+                match attempt.await {
                     Ok(target) => return Ok(target),
                     Err(Error::Resolve(message)) if message == "bounded DNS admission is busy" => {
-                        let retry_at = nagoya::time::now_ns().saturating_add(1_000_000).min(deadline);
+                        let retry_at =
+                            nagoya::time::now_ns().saturating_add(1_000_000).min(deadline);
                         nagoya::sleep_until(retry_at).await;
                     }
                     Err(error) => return Err(error),
