@@ -112,12 +112,12 @@ impl Target {
                 nagoya::resolve::ResolveUntilError::Deadline => {
                     Error::Timeout(format!("DNS for {host} exceeded the request deadline"))
                 }
-                nagoya::resolve::ResolveUntilError::Busy => Error::Resolve(
-                    "bounded DNS admission is busy".into(),
-                ),
-                nagoya::resolve::ResolveUntilError::Closed => Error::Resolve(
-                    "bounded DNS resolver is unavailable".into(),
-                ),
+                nagoya::resolve::ResolveUntilError::Busy => {
+                    Error::Resolve("bounded DNS admission is busy".into())
+                }
+                nagoya::resolve::ResolveUntilError::Closed => {
+                    Error::Resolve("bounded DNS resolver is unavailable".into())
+                }
                 nagoya::resolve::ResolveUntilError::Resolve(error) => {
                     Error::Resolve(error.to_string())
                 }
@@ -690,11 +690,16 @@ impl ResponseParser {
             || code.len() != 3
             || !code.bytes().all(|byte| byte.is_ascii_digit())
             || reason.is_none()
-            || !reason.unwrap_or_default().bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+            || !reason
+                .unwrap_or_default()
+                .bytes()
+                .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
         {
             return Err(protocol("malformed HTTP/1.x status line"));
         }
-        let status = code.parse::<u16>().map_err(|_| protocol("invalid status code"))?;
+        let status = code
+            .parse::<u16>()
+            .map_err(|_| protocol("invalid status code"))?;
         if !(100..=599).contains(&status) {
             return Err(protocol("status code is outside the HTTP range"));
         }
@@ -709,7 +714,9 @@ impl ResponseParser {
                 return Err(protocol("malformed response header"));
             };
             if !is_http_token(name)
-                || !value.bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+                || !value
+                    .bytes()
+                    .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
             {
                 return Err(protocol("malformed response header"));
             }
@@ -741,7 +748,8 @@ impl ResponseParser {
                 chunked = true;
             }
             if !interim {
-                self.headers.push((name.to_string(), value.trim().to_string()));
+                self.headers
+                    .push((name.to_string(), value.trim().to_string()));
             }
         }
         if (interim || status == 204) && (content_length.is_some() || chunked) {
@@ -759,9 +767,7 @@ impl ResponseParser {
         self.body_start = head_end + 4;
         self.chunk_cursor = self.body_start;
         self.chunk_scan = self.body_start;
-        let bodiless = head_request
-            || self.status == 204
-            || self.status == 304;
+        let bodiless = head_request || self.status == 204 || self.status == 304;
         self.framing = Some(if bodiless {
             BodyFraming::Bodiless
         } else if chunked {
@@ -822,13 +828,12 @@ impl ResponseParser {
                 let value = &line[colon + 1..];
                 if !name.is_ascii()
                     || !is_http_token(std::str::from_utf8(name).expect("ASCII field name"))
-                    || !value.iter().all(|byte| {
-                        *byte == b'\t' || *byte >= 0x20 && *byte != 0x7f
-                    })
+                    || !value
+                        .iter()
+                        .all(|byte| *byte == b'\t' || *byte >= 0x20 && *byte != 0x7f)
                     || ["content-length", "transfer-encoding", "host"]
-                        .iter().any(|forbidden| {
-                            name.eq_ignore_ascii_case(forbidden.as_bytes())
-                        })
+                        .iter()
+                        .any(|forbidden| name.eq_ignore_ascii_case(forbidden.as_bytes()))
                 {
                     return Err(protocol("malformed or forbidden chunk trailer"));
                 }
@@ -1177,9 +1182,11 @@ mod tests {
         .unwrap();
         assert!(matches!(result, Err(Error::Tls(_))));
         let flight = server.join().unwrap();
-        assert!(flight
-            .windows(b"pinned.example".len())
-            .any(|window| window == b"pinned.example"));
+        assert!(
+            flight
+                .windows(b"pinned.example".len())
+                .any(|window| window == b"pinned.example")
+        );
     }
 
     #[test]
@@ -1359,14 +1366,23 @@ mod tests {
     fn strict_response_framing_rejects_bad_suffix_and_trailers() {
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         let bad_suffix = [head.as_slice(), b"1\r\nxX0\r\n\r\n"].concat();
-        assert!(matches!(parse_response(&bad_suffix, false, false), Err(Error::Protocol(_))));
+        assert!(matches!(
+            parse_response(&bad_suffix, false, false),
+            Err(Error::Protocol(_))
+        ));
 
         let incomplete = [head.as_slice(), b"0\r\nX-End: yes\r\n"].concat();
         assert!(parse_response(&incomplete, false, false).unwrap().is_none());
-        assert!(matches!(parse_response(&incomplete, true, false), Err(Error::Protocol(_))));
+        assert!(matches!(
+            parse_response(&incomplete, true, false),
+            Err(Error::Protocol(_))
+        ));
 
         let malformed = [head.as_slice(), b"0\r\nnot-a-field\r\n\r\n"].concat();
-        assert!(matches!(parse_response(&malformed, false, false), Err(Error::Protocol(_))));
+        assert!(matches!(
+            parse_response(&malformed, false, false),
+            Err(Error::Protocol(_))
+        ));
 
         let valid = [head.as_slice(), b"1\r\nx\r\n0\r\nX-End: yes\r\n\r\n"].concat();
         let response = parse_response(&valid, false, false).unwrap().unwrap();
@@ -1388,13 +1404,8 @@ mod tests {
         assert_eq!(response.body, b"x");
         assert_eq!(response.header("x-note"), None);
 
-        let non_ascii_name = [
-            head.as_slice(),
-            b"0\r\nX-",
-            &[0xe9][..],
-            b": value\r\n\r\n",
-        ]
-        .concat();
+        let non_ascii_name =
+            [head.as_slice(), b"0\r\nX-", &[0xe9][..], b": value\r\n\r\n"].concat();
         assert!(matches!(
             parse_response(&non_ascii_name, false, false),
             Err(Error::Protocol(_))
@@ -1424,9 +1435,15 @@ mod tests {
             assert!(matches!(parse_response(raw, false, false), Err(Error::Protocol(_))));
         }
         let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        assert_eq!(parse_response(valid, false, false).unwrap().unwrap().body, b"ok");
+        assert_eq!(
+            parse_response(valid, false, false).unwrap().unwrap().body,
+            b"ok"
+        );
         let legacy = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        assert_eq!(parse_response(legacy, false, false).unwrap().unwrap().body, b"ok");
+        assert_eq!(
+            parse_response(legacy, false, false).unwrap().unwrap().body,
+            b"ok"
+        );
     }
 
     #[test]
@@ -1451,9 +1468,11 @@ mod tests {
         assert_eq!(parser.head_start, interim.len());
         assert_eq!(parser.head_parses, 3);
         assert!(parser.delimiter_candidates <= raw.len());
-        assert!(parse_response_with_limit(interim, false, false, Some(0))
-            .unwrap()
-            .is_none());
+        assert!(
+            parse_response_with_limit(interim, false, false, Some(0))
+                .unwrap()
+                .is_none()
+        );
         assert!(matches!(
             parse_response(interim, true, false),
             Err(Error::Protocol(_))
@@ -1510,10 +1529,12 @@ mod tests {
             for head_request in [false, true] {
                 let mut parser = ResponseParser::new(Some(0));
                 for end in 1..head.len() {
-                    assert!(parser
-                        .advance(&head[..end], false, head_request)
-                        .unwrap()
-                        .is_none());
+                    assert!(
+                        parser
+                            .advance(&head[..end], false, head_request)
+                            .unwrap()
+                            .is_none()
+                    );
                 }
                 let error = parser
                     .advance(head, false, head_request)
@@ -1546,8 +1567,12 @@ mod tests {
             for max_body in [None, Some(0)] {
                 let mut parser = ResponseParser::new(max_body);
                 for end in 1..raw.len() {
-                    assert!(parser.advance(&raw.as_bytes()[..end], false, head_request)
-                        .unwrap().is_none());
+                    assert!(
+                        parser
+                            .advance(&raw.as_bytes()[..end], false, head_request)
+                            .unwrap()
+                            .is_none()
+                    );
                 }
                 let response = parser
                     .advance(raw.as_bytes(), false, head_request)
@@ -1567,14 +1592,10 @@ mod tests {
                 ];
                 assert_eq!(response.headers, expected_headers);
 
-                let coalesced = parse_response_with_limit(
-                    raw.as_bytes(),
-                    false,
-                    head_request,
-                    max_body,
-                )
-                    .unwrap()
-                    .unwrap();
+                let coalesced =
+                    parse_response_with_limit(raw.as_bytes(), false, head_request, max_body)
+                        .unwrap()
+                        .unwrap();
                 assert_eq!(coalesced.status, status);
                 assert_eq!(coalesced.body, b"");
                 assert_eq!(coalesced.headers, expected_headers);
@@ -1597,10 +1618,13 @@ mod tests {
             .expect("HEAD final response completes at its header boundary");
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"");
-        assert_eq!(response.headers, vec![
-            ("Content-Length".to_string(), "7".to_string()),
-            ("X-Final".to_string(), "yes".to_string()),
-        ]);
+        assert_eq!(
+            response.headers,
+            vec![
+                ("Content-Length".to_string(), "7".to_string()),
+                ("X-Final".to_string(), "yes".to_string()),
+            ]
+        );
         assert_eq!(response.header("x-interim"), None);
         assert_eq!(response.header("link"), None);
     }
@@ -1613,8 +1637,8 @@ mod tests {
         assert_eq!(response.status, 204);
         assert_eq!(response.body, b"");
 
-        let upgrade = parse_response(b"HTTP/1.1 101 Switching Protocols\r\n\r\n", false, false)
-            .unwrap_err();
+        let upgrade =
+            parse_response(b"HTTP/1.1 101 Switching Protocols\r\n\r\n", false, false).unwrap_err();
         assert!(matches!(upgrade, Error::Protocol(ref detail)
             if detail == "switching protocols is unsupported"));
         let legacy_te = parse_response(
@@ -1644,38 +1668,66 @@ mod tests {
 
         let close = b"HTTP/1.0 200 OK\r\n\r\nok";
         assert!(parse_response(close, false, false).unwrap().is_none());
-        assert_eq!(parse_response(close, true, false).unwrap().unwrap().body, b"ok");
+        assert_eq!(
+            parse_response(close, true, false).unwrap().unwrap().body,
+            b"ok"
+        );
     }
 
     #[test]
     fn framing_values_require_http_numeric_and_extension_syntax() {
         for value in ["+1", "-1", "", "\u{a0}1", "1\u{a0}", "\u{FF11}", "1 0"] {
             let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {value}\r\n\r\nx");
-            assert!(matches!(
-                parse_response(raw.as_bytes(), false, false),
-                Err(Error::Protocol(_))
-            ), "accepted Content-Length {value:?}");
+            assert!(
+                matches!(
+                    parse_response(raw.as_bytes(), false, false),
+                    Err(Error::Protocol(_))
+                ),
+                "accepted Content-Length {value:?}"
+            );
         }
         let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: \t01\t \r\n\r\nx";
-        assert_eq!(parse_response(fixed, false, false).unwrap().unwrap().body, b"x");
+        assert_eq!(
+            parse_response(fixed, false, false).unwrap().unwrap().body,
+            b"x"
+        );
 
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         for line in [
-            "+1", "-1", "", " 1", "\u{a0}1", "1\u{a0}", "0x1", "1 ",
-            "1;", "1;=yes", "1;ext=", "1;ext=a b", "1;ext ", "1;ext=ok ",
-            "1;ext=\"unterminated", "1;ext=\"a\\", "1;ext=\"a\"extra",
-            "1;ext=a\nb", "1;ext=\"a\rb\"", "1;ext=\"a\\\nb\"",
+            "+1",
+            "-1",
+            "",
+            " 1",
+            "\u{a0}1",
+            "1\u{a0}",
+            "0x1",
+            "1 ",
+            "1;",
+            "1;=yes",
+            "1;ext=",
+            "1;ext=a b",
+            "1;ext ",
+            "1;ext=ok ",
+            "1;ext=\"unterminated",
+            "1;ext=\"a\\",
+            "1;ext=\"a\"extra",
+            "1;ext=a\nb",
+            "1;ext=\"a\rb\"",
+            "1;ext=\"a\\\nb\"",
             "1;ext=\"a\x7fb\"",
         ] {
             let raw = [head.as_slice(), line.as_bytes(), b"\r\nx\r\n0\r\n\r\n"].concat();
-            assert!(matches!(
-                parse_response(&raw, false, false),
-                Err(Error::Protocol(_))
-            ), "accepted chunk line {line:?}");
+            assert!(
+                matches!(parse_response(&raw, false, false), Err(Error::Protocol(_))),
+                "accepted chunk line {line:?}"
+            );
         }
         let valid = b"1 \t; flag ; ext \t= \t\"a;\\\"b\\\\c\";word=abc\r\nx\r\n0;last=\"\"\r\n\r\n";
         let raw = [head.as_slice(), valid.as_slice()].concat();
-        assert_eq!(parse_response(&raw, false, false).unwrap().unwrap().body, b"x");
+        assert_eq!(
+            parse_response(&raw, false, false).unwrap().unwrap().body,
+            b"x"
+        );
     }
 
     #[test]
@@ -1683,7 +1735,8 @@ mod tests {
         let interim = "HTTP/1.1 103 Early Hints\r\n\r\n";
         let placeholder = format!("{interim}HTTP/1.1 200 OK\r\nContent-Length: 00000000\r\n\r\n");
         let body_len = MAX_RESPONSE - placeholder.len();
-        let head = format!("{interim}HTTP/1.1 200 OK\r\nContent-Length: {body_len:08}\r\n\r\n").into_bytes();
+        let head = format!("{interim}HTTP/1.1 200 OK\r\nContent-Length: {body_len:08}\r\n\r\n")
+            .into_bytes();
         assert_eq!(head.len(), placeholder.len());
         let mut exact_wire = head.clone();
         exact_wire.resize(MAX_RESPONSE, b'x');
@@ -1694,10 +1747,12 @@ mod tests {
             let start = exact.len();
             let end = (start + 16 * 1024).min(MAX_RESPONSE - 1);
             append_wire_bytes(&mut exact, &exact_wire[start..end]).unwrap();
-            assert!(exact_parser
-                .advance(&exact, false, false)
-                .unwrap()
-                .is_none());
+            assert!(
+                exact_parser
+                    .advance(&exact, false, false)
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert_eq!(exact.len(), MAX_RESPONSE - 1);
         append_wire_bytes(&mut exact, &exact_wire[MAX_RESPONSE - 1..MAX_RESPONSE]).unwrap();
@@ -1740,7 +1795,12 @@ mod tests {
                 let coalesced = parse_response(&raw, false, false);
                 if length == 1024 {
                     assert!(before_cr.unwrap().is_none());
-                    assert!(parser.advance(&raw[..line_end + 1], false, false).unwrap().is_none());
+                    assert!(
+                        parser
+                            .advance(&raw[..line_end + 1], false, false)
+                            .unwrap()
+                            .is_none()
+                    );
                     assert!(after_cr.unwrap().is_none());
                     let fragmented = parser.advance(&raw, false, false).unwrap().unwrap();
                     let coalesced = coalesced.unwrap().unwrap();
