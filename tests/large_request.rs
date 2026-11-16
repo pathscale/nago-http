@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use nago_http::{send, Request, Target};
+use nago_http::{Request, Target, send};
 
 #[test]
 fn put_writes_a_large_body_to_a_slow_reader() {
