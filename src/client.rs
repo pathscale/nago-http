@@ -19,14 +19,130 @@
 //! # Ok::<(), nago_http::Error>(())
 //! ```
 
-use std::collections::HashMap;
-use std::future::{Future, poll_fn};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use core::future::{Future, poll_fn};
+use core::sync::atomic::{AtomicU8, Ordering};
+use core::task::Poll;
+use core::time::Duration;
 
 use nagoya::reactor::Reactor;
 
 use crate::{Error, Request, Response, Target};
+
+struct SimpleMutex<T> {
+    state: AtomicU8,
+    value: core::cell::UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SimpleMutex<T> {}
+unsafe impl<T: Send> Sync for SimpleMutex<T> {}
+
+struct SimpleMutexGuard<'a, T> {
+    mutex: &'a SimpleMutex<T>,
+}
+
+impl<T> SimpleMutex<T> {
+    const fn new(value: T) -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            value: core::cell::UnsafeCell::new(value),
+        }
+    }
+
+    fn lock(&self) -> Result<SimpleMutexGuard<'_, T>, ()> {
+        while self
+            .state
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Ok(SimpleMutexGuard { mutex: self })
+    }
+}
+
+impl<T: Default> Default for SimpleMutex<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> core::ops::Deref for SimpleMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for SimpleMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T> Drop for SimpleMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.state.store(0, Ordering::Release);
+    }
+}
+
+struct SimpleOnceLock<T> {
+    state: AtomicU8,
+    value: core::cell::UnsafeCell<core::mem::MaybeUninit<T>>,
+}
+
+unsafe impl<T: Send + Sync> Sync for SimpleOnceLock<T> {}
+unsafe impl<T: Send> Send for SimpleOnceLock<T> {}
+
+impl<T> SimpleOnceLock<T> {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            value: core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()),
+        }
+    }
+
+    fn get(&self) -> Option<&T> {
+        if self.state.load(Ordering::Acquire) == 2 {
+            Some(unsafe { (*self.value.get()).assume_init_ref() })
+        } else {
+            None
+        }
+    }
+
+    fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
+        if let Some(val) = self.get() {
+            return val;
+        }
+        loop {
+            match self
+                .state
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    let val = f();
+                    unsafe { (*self.value.get()).write(val) };
+                    self.state.store(2, Ordering::Release);
+                    return unsafe { (*self.value.get()).assume_init_ref() };
+                }
+                Err(2) => return unsafe { (*self.value.get()).assume_init_ref() },
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
+    }
+}
+
+impl<T> Drop for SimpleOnceLock<T> {
+    fn drop(&mut self) {
+        if *self.state.get_mut() == 2 {
+            unsafe { (*self.value.get()).assume_init_drop() };
+        }
+    }
+}
 
 const MAX_RESOLVED_TARGETS: usize = 256;
 
@@ -39,7 +155,7 @@ struct CachedTarget {
 
 #[derive(Default)]
 struct TargetCache {
-    entries: HashMap<TargetKey, CachedTarget>,
+    entries: BTreeMap<TargetKey, CachedTarget>,
 }
 
 impl TargetCache {
@@ -77,13 +193,13 @@ impl TargetCache {
 }
 
 #[cfg(test)]
-type ResolveHook = std::sync::Arc<
+type ResolveHook = Arc<
     dyn Fn(
             String,
             u16,
             bool,
             u64,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Target, Error>> + Send>>
+        ) -> core::pin::Pin<Box<dyn Future<Output = Result<Target, Error>> + Send>>
         + Send
         + Sync,
 >;
@@ -93,12 +209,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Requests by URL, over a reactor this client runs on its own thread.
 pub struct Client {
-    tls_config: Option<std::sync::Arc<nago_rustls::rustls::ClientConfig>>,
+    tls_config: Option<Arc<nago_rustls::rustls::ClientConfig>>,
     reactor: Reactor,
     /// Targets by (TLS, host, port). Resolved targets are retained up to
     /// `MAX_RESOLVED_TARGETS`, then re-resolved after capacity eviction or a
     /// connection failure. Pinned targets stay cached.
-    targets: Mutex<TargetCache>,
+    targets: SimpleMutex<TargetCache>,
     resolver: &'static nagoya::resolve::Resolver,
     #[cfg(test)]
     resolve_hook: Option<ResolveHook>,
@@ -128,7 +244,7 @@ impl Client {
     }
 
     fn start(
-        tls_config: Option<std::sync::Arc<nago_rustls::rustls::ClientConfig>>,
+        tls_config: Option<Arc<nago_rustls::rustls::ClientConfig>>,
     ) -> Result<Self, Error> {
         let resolver = nagoya::resolve::Resolver::shared()
             .map_err(|err| Error::Io(format!("starting the DNS resolver: {err}")))?;
@@ -137,7 +253,7 @@ impl Client {
         Ok(Self {
             tls_config,
             reactor,
-            targets: Mutex::new(TargetCache::default()),
+            targets: SimpleMutex::new(TargetCache::default()),
             resolver,
             #[cfg(test)]
             resolve_hook: None,
@@ -149,7 +265,7 @@ impl Client {
     /// First use initializes shared DNS workers synchronously, so call this
     /// during setup before entering a reactor callback.
     pub fn global() -> Result<&'static Self, Error> {
-        static CLIENT: OnceLock<Client> = OnceLock::new();
+        static CLIENT: SimpleOnceLock<Client> = SimpleOnceLock::new();
         if let Some(client) = CLIENT.get() {
             return Ok(client);
         }
@@ -166,7 +282,7 @@ impl Client {
     /// The first call initializes shared DNS workers, so make it during
     /// synchronous setup before entering a reactor callback.
     pub fn with_tls_config(
-        config: std::sync::Arc<nago_rustls::rustls::ClientConfig>,
+        config: Arc<nago_rustls::rustls::ClientConfig>,
     ) -> Result<Self, Error> {
         Self::start(Some(config))
     }
@@ -218,22 +334,22 @@ impl Client {
         let mut timer = Box::pin(nagoya::sleep_until(deadline_ns));
         let result = poll_fn(|cx| {
             if nagoya::time::now_ns() >= deadline_ns {
-                return std::task::Poll::Ready(None);
+                return Poll::Ready(None);
             }
             match exchange.as_mut().poll(cx) {
-                std::task::Poll::Ready(result) => {
-                    return std::task::Poll::Ready(if nagoya::time::now_ns() >= deadline_ns {
+                Poll::Ready(result) => {
+                    return Poll::Ready(if nagoya::time::now_ns() >= deadline_ns {
                         None
                     } else {
                         Some(result)
                     });
                 }
-                std::task::Poll::Pending => {}
+                Poll::Pending => {}
             }
             if timer.as_mut().poll(cx).is_ready() || nagoya::time::now_ns() >= deadline_ns {
-                std::task::Poll::Ready(None)
+                Poll::Ready(None)
             } else {
-                std::task::Poll::Pending
+                Poll::Pending
             }
         })
         .await

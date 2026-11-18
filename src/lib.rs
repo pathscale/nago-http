@@ -40,10 +40,17 @@
 //! the API deserves. [`Client`] gives every request a deadline, 30 s unless
 //! [`Client::with_timeout`] says otherwise.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 
-use nago_rustls::TlsSession;
-use nago_rustls::rustls::ClientConnection;
+use nago_rustls::{ClientConnection, TlsSession};
 use nago_rustls::rustls_pki_types::ServerName;
 use nagoya::io::Stream;
 use nagoya::reactor::{Addr, Handle, TcpStream, connect_any, resolve};
@@ -137,7 +144,7 @@ impl Target {
     pub fn pinned(
         host: &str,
         port: u16,
-        addrs: &[std::net::IpAddr],
+        addrs: &[core::net::IpAddr],
         tls: bool,
     ) -> Result<Self, Error> {
         if host.is_empty() {
@@ -152,8 +159,8 @@ impl Target {
         let addrs = addrs
             .iter()
             .map(|address| match address {
-                std::net::IpAddr::V4(address) => Addr::V4(address.octets(), port),
-                std::net::IpAddr::V6(address) => Addr::V6(address.octets(), port),
+                core::net::IpAddr::V4(address) => Addr::V4(address.octets(), port),
+                core::net::IpAddr::V6(address) => Addr::V6(address.octets(), port),
             })
             .collect();
         Ok(Self {
@@ -345,6 +352,7 @@ impl fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 pub(crate) fn require_crypto_provider() -> Result<(), Error> {
@@ -366,6 +374,56 @@ pub async fn open(target: &Target, handle: &Handle) -> Result<Connection, Error>
     open_with_tls_config(target, handle, None).await
 }
 
+#[cfg(not(feature = "std"))]
+#[derive(Debug)]
+struct EkoTimeProvider;
+
+#[cfg(not(feature = "std"))]
+impl rustls::time_provider::TimeProvider for EkoTimeProvider {
+    fn current_time(&self) -> Option<nago_rustls::rustls_pki_types::UnixTime> {
+        #[cfg(feature = "eko")]
+        {
+            let secs = eko::time::epoch_secs();
+            if secs >= 0 {
+                return Some(nago_rustls::rustls_pki_types::UnixTime::since_unix_epoch(
+                    core::time::Duration::from_secs(secs as u64),
+                ));
+            }
+            None
+        }
+        #[cfg(not(feature = "eko"))]
+        {
+            None
+        }
+    }
+}
+
+fn client_config_builder(
+    provider: Option<Arc<rustls::crypto::CryptoProvider>>,
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, Error> {
+    #[cfg(feature = "std")]
+    {
+        match provider {
+            Some(provider) => rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|err| Error::Tls(err.to_string())),
+            None => Ok(rustls::ClientConfig::builder()),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let provider = match provider {
+            Some(provider) => provider,
+            None => rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .ok_or_else(|| Error::Tls("no process-default rustls CryptoProvider".into()))?,
+        };
+        rustls::ClientConfig::builder_with_details(provider, Arc::new(EkoTimeProvider))
+            .with_safe_default_protocol_versions()
+            .map_err(|err| Error::Tls(err.to_string()))
+    }
+}
+
 /// Open with the caller's TLS policy. `None` uses the host's process-default
 /// provider and default roots, with one RSA-PSS retry for matching handshake
 /// errors. Supplied configs are used as provided, with no verifier retry. Plain
@@ -373,7 +431,7 @@ pub async fn open(target: &Target, handle: &Handle) -> Result<Connection, Error>
 pub async fn open_with_tls_config(
     target: &Target,
     handle: &Handle,
-    tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<Connection, Error> {
     if !target.tls {
         let stream = connect_any(&target.addrs, handle)
@@ -400,25 +458,23 @@ pub async fn open_with_tls_config(
     // ECC-only verifier uses ps-rustcrypto's provider for certificate checks.
     let verifier = ps_rustcrypto::policy::EccOnlyVerifier::new(roots.clone())
         .map_err(|err| Error::Tls(err.to_string()))?;
-    let config = rustls::ClientConfig::builder()
+    let config = client_config_builder(None)?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    match open_tls_with_config(target, handle, std::sync::Arc::new(config)).await {
+    match open_tls_with_config(target, handle, Arc::new(config)).await {
         Ok(connection) => Ok(connection),
         Err((error, false)) => Err(error),
         Err((_, true)) => {
             let verifier = ps_rustcrypto::fallback::rsa_fallback_ct_verifier(roots.clone(), roots)
                 .map_err(|err| Error::Tls(err.to_string()))?;
-            let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            let config = client_config_builder(Some(Arc::new(
                 ps_rustcrypto::provider_with_rsa_pss(),
-            ))
-            .with_safe_default_protocol_versions()
-            .map_err(|err| Error::Tls(err.to_string()))?
+            )))?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-            open_tls_with_config(target, handle, std::sync::Arc::new(config))
+            open_tls_with_config(target, handle, Arc::new(config))
                 .await
                 .map_err(|(error, _)| error)
         }
@@ -428,7 +484,7 @@ pub async fn open_with_tls_config(
 async fn open_tls_with_config(
     target: &Target,
     handle: &Handle,
-    tls_config: std::sync::Arc<rustls::ClientConfig>,
+    tls_config: Arc<rustls::ClientConfig>,
 ) -> Result<Connection, (Error, bool)> {
     let name = ServerName::try_from(target.host.clone()).map_err(|_| {
         (
@@ -678,7 +734,7 @@ impl ResponseParser {
         head_request: bool,
     ) -> Result<(), Error> {
         let protocol = |detail: &str| Error::Protocol(detail.to_string());
-        let head = std::str::from_utf8(&buffer[self.head_start..head_end])
+        let head = core::str::from_utf8(&buffer[self.head_start..head_end])
             .map_err(|_| protocol("headers are not UTF-8"))?;
         let mut lines = head.split("\r\n");
         let status_line = lines.next().unwrap_or_default();
@@ -817,7 +873,7 @@ impl ResponseParser {
                     return Ok(None);
                 };
                 if line_end == line_start {
-                    let body = std::mem::take(&mut self.body);
+                    let body = core::mem::take(&mut self.body);
                     return Ok(Some(self.response(body)));
                 }
                 let line = &buffer[line_start..line_end];
@@ -827,7 +883,7 @@ impl ResponseParser {
                 let name = &line[..colon];
                 let value = &line[colon + 1..];
                 if !name.is_ascii()
-                    || !is_http_token(std::str::from_utf8(name).expect("ASCII field name"))
+                    || !is_http_token(core::str::from_utf8(name).expect("ASCII field name"))
                     || !value
                         .iter()
                         .all(|byte| *byte == b'\t' || *byte >= 0x20 && *byte != 0x7f)
@@ -855,7 +911,7 @@ impl ResponseParser {
                             return Ok(None);
                         }
                         self.append_payload(buffer, self.chunk_cursor, remaining);
-                        let body = std::mem::take(&mut self.body);
+                        let body = core::mem::take(&mut self.body);
                         return Ok(Some(self.response(body)));
                     }
                 }
@@ -870,7 +926,7 @@ impl ResponseParser {
                 self.chunk_payload_end = None;
                 self.chunk_suffix_pending = true;
                 if self.cap.is_some_and(|cap| self.body.len() == cap) {
-                    let body = std::mem::take(&mut self.body);
+                    let body = core::mem::take(&mut self.body);
                     return Ok(Some(self.response(body)));
                 }
                 continue;
@@ -943,7 +999,7 @@ fn parse_chunk_size(line: &[u8]) -> Option<usize> {
         .iter()
         .position(|byte| !byte.is_ascii_hexdigit())
         .unwrap_or(line.len());
-    let size = usize::from_str_radix(std::str::from_utf8(&line[..hex_end]).ok()?, 16).ok()?;
+    let size = usize::from_str_radix(core::str::from_utf8(&line[..hex_end]).ok()?, 16).ok()?;
 
     let mut extension = line[hex_end..].iter().copied().peekable();
     let is_space = |byte: &u8| matches!(byte, b' ' | b'\t');
