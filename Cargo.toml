@@ -1,6 +1,6 @@
 [package]
 name = "nago-http"
-version = "0.2.1"
+version = "0.2.2"
 publish = ["crates-io"]
 
 edition = "2024"
@@ -12,16 +12,16 @@ keywords = ["http", "https", "client", "no-runtime", "nagoya"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [features]
-default = ["std"]
-std = ["nagoya/reactor", "nago-rustls/std", "ps-rustcrypto/std"]
-eko = ["dep:ekostd", "ekostd/libc-rs", "nagoya/eko", "nago-rustls/eko", "ps-rustcrypto/eko"]
+default = []
+std = ["nago-rustls/std", "ps-rustcrypto/std"]
 
 [dependencies]
-ekostd = { version = "^0.2.9", optional = true }
-nagoya = { version = "^0.1.21", default-features = false }
-nago-rustls = { version = "^0.2.1", default-features = false, features = ["webpki-roots"] }
-ps-rustcrypto = { version = "^0.6.1", default-features = false, features = ["alloc", "tls12", "zeroize", "rsa-pss"] }
+ekostd = { version = "^0.2.10", default-features = false }
+nagoya = { version = "^0.1.22", default-features = false, features = ["reactor"] }
+nago-rustls = { version = "^0.2.2", default-features = false, features = ["webpki-roots"] }
+ps-rustcrypto = { version = "^0.6.2", default-features = false, features = ["alloc", "tls12", "zeroize", "rsa-pss"] }
 webpki-roots = "^1"
 
 [dev-dependencies]
 rcgen = "0.14"
+rustls = { version = "^0.23", default-features = false, features = ["std", "tls12"] }

@@ -477,6 +477,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
     use std::sync::mpsc;
     use std::thread;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     #[test]
     fn malformed_ports_do_not_echo_input() {

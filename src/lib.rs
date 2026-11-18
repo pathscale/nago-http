@@ -16,7 +16,7 @@
 //! use nagoya::reactor::{Reactor, block_on_with};
 //!
 //! let target = nago_http::Target::resolve("api.example.com", 443)?;
-//! let reactor = Reactor::local()?;
+//! let reactor = Reactor::local().unwrap();
 //! let handle = reactor.handle();
 //! let response = block_on_with(&reactor, nago_http::send(
 //!     &target,
@@ -40,8 +40,10 @@
 //! the API deserves. [`Client`] gives every request a deadline, 30 s unless
 //! [`Client::with_timeout`] says otherwise.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 
+#[cfg(test)]
+extern crate std;
 extern crate alloc;
 
 use alloc::format;
@@ -352,8 +354,7 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 pub(crate) fn require_crypto_provider() -> Result<(), Error> {
     rustls::crypto::CryptoProvider::get_default()
@@ -374,54 +375,18 @@ pub async fn open(target: &Target, handle: &Handle) -> Result<Connection, Error>
     open_with_tls_config(target, handle, None).await
 }
 
-#[cfg(not(feature = "std"))]
-#[derive(Debug)]
-struct EkoTimeProvider;
-
-#[cfg(not(feature = "std"))]
-impl rustls::time_provider::TimeProvider for EkoTimeProvider {
-    fn current_time(&self) -> Option<nago_rustls::rustls_pki_types::UnixTime> {
-        #[cfg(feature = "eko")]
-        {
-            let secs = eko::time::epoch_secs();
-            if secs >= 0 {
-                return Some(nago_rustls::rustls_pki_types::UnixTime::since_unix_epoch(
-                    core::time::Duration::from_secs(secs as u64),
-                ));
-            }
-            None
-        }
-        #[cfg(not(feature = "eko"))]
-        {
-            None
-        }
-    }
-}
-
 fn client_config_builder(
     provider: Option<Arc<rustls::crypto::CryptoProvider>>,
 ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, Error> {
-    #[cfg(feature = "std")]
-    {
-        match provider {
-            Some(provider) => rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map_err(|err| Error::Tls(err.to_string())),
-            None => Ok(rustls::ClientConfig::builder()),
-        }
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        let provider = match provider {
-            Some(provider) => provider,
-            None => rustls::crypto::CryptoProvider::get_default()
-                .cloned()
-                .ok_or_else(|| Error::Tls("no process-default rustls CryptoProvider".into()))?,
-        };
-        rustls::ClientConfig::builder_with_details(provider, Arc::new(EkoTimeProvider))
-            .with_safe_default_protocol_versions()
-            .map_err(|err| Error::Tls(err.to_string()))
-    }
+    let provider = match provider {
+        Some(provider) => provider,
+        None => rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .ok_or_else(|| Error::Tls("no process-default rustls CryptoProvider".into()))?,
+    };
+    rustls::ClientConfig::builder_with_details(provider, Arc::new(nago_rustls::EkoTimeProvider))
+        .with_safe_default_protocol_versions()
+        .map_err(|err| Error::Tls(err.to_string()))
 }
 
 /// Open with the caller's TLS policy. `None` uses the host's process-default
@@ -1107,6 +1072,7 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+    use std::vec;
 
     fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
