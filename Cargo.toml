@@ -1,6 +1,6 @@
 [package]
 name = "nago-http"
-version = "0.2.2"
+version = "0.2.3"
 publish = ["crates-io"]
 
 edition = "2024"
@@ -9,16 +9,15 @@ description = "A small HTTP/1.1 client over nagoya and nago-rustls. No tokio, no
 repository = "https://github.com/pathscale/nago-http"
 readme = "README.md"
 keywords = ["http", "https", "client", "no-runtime", "nagoya"]
-categories = ["network-programming", "web-programming::http-client"]
+categories = ["network-programming", "web-programming::http-client", "no-std"]
 
 [features]
 default = []
-std = ["nago-rustls/std", "ps-rustcrypto/std"]
 
 [dependencies]
-ekostd = { version = "^0.2.10", default-features = false }
-nagoya = { version = "^0.1.22", default-features = false, features = ["reactor"] }
-nago-rustls = { version = "^0.2.2", default-features = false, features = ["webpki-roots"] }
+ekostd = { version = "^0.2.11", default-features = false }
+nagoya = { version = "^0.1.24", default-features = false, features = ["reactor"] }
+nago-rustls = { version = "^0.2.3", default-features = false, features = ["webpki-roots"] }
 ps-rustcrypto = { version = "^0.6.2", default-features = false, features = ["alloc", "tls12", "zeroize", "rsa-pss"] }
 webpki-roots = "^1"
 
